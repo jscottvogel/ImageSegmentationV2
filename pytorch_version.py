@@ -215,7 +215,7 @@ def train_loop():
     print(f"Training for {TrainingConfig.EPOCHS} Epochs on {len(tr_img)} images...")
     
     try:
-        model = torch.compile(model)
+        # model = torch.compile(model) # DISABLED: AMD ROCm hardware crash on FP16/Triton
     except Exception:
         pass
         
@@ -230,7 +230,7 @@ def train_loop():
             im, mt, et = im.to(device, non_blocking=True), tgts['main_output'].to(device, non_blocking=True), tgts['edge_output'].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', enabled=False): # DISABLED: AMD ROCm FP16 hardware crash
                 o = model(im)
                 dl, intersection, union = d_loss(o['main_output'], mt)
                 loss = (0.2 * wce(o['main_output'], mt) + 0.3 * ftl(o['main_output'], mt) + 0.5 * dl + 
