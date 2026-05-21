@@ -46,44 +46,44 @@ logger = logging.getLogger(__name__)
 
 # === CONFIGURATION ===
 class DatasetConfig:
-    IMG_HEIGHT: int = 512
-    IMG_WIDTH: int = 512
+    IMG_HEIGHT: int = 480
+    IMG_WIDTH: int = 640
     NUM_CLASSES: int = 10
     IMAGE_SIZE: Tuple[int, int] = (IMG_HEIGHT, IMG_WIDTH)
     TRAIN_IMG_DIR: str = "/home/fred/Downloads/opencv-tf-project-3-image-segmentation-round-2/Project_3_FloodNet_Dataset/train/images"
     TRAIN_MSK_DIR: str = "/home/fred/Downloads/opencv-tf-project-3-image-segmentation-round-2/Project_3_FloodNet_Dataset/train/masks"
 
 class TrainingConfig:
-    BATCH_SIZE: int = 8
-    EPOCHS: int = 70
-    ROUTER_EPOCH: int = 30 # Epoch at which we activate Lovasz and OHEM Phase 2
+    BATCH_SIZE: int = 4
+    GRAD_ACCUMULATION_STEPS: int = 2
+    EPOCHS: int = 40
+    ROUTER_EPOCH: int = 20 # Delayed Phase 2 transition due to increased epochs
     LEARNING_RATE: float = 0.0001
     WEIGHT_DECAY: float = 1e-5
     CHECKPOINT_DIR: str = 'model_checkpoint/FloodNet_PyTorch'
     LOG_INTERVAL: int = 25
+    PSEUDO_IMG_DIR: str = "/home/fred/Downloads/opencv-tf-project-3-image-segmentation-round-2/Project_3_FloodNet_Dataset/test/images"
+    PSEUDO_MSK_DIR: str = "confident_pseudo_masks"
 
 id2color: Dict[int, List[int]] = {
     0: [0, 0, 0], 1: [255, 0, 0], 2: [200, 90, 90], 3: [128, 128, 0], 4: [155, 155, 155],
     5: [0, 255, 255], 6: [55, 0, 255], 7: [255, 0, 255], 8: [245, 245, 0], 9: [0, 255, 0],
+    255: [255, 255, 255] # Explicit ignore-index color matching
 }
 
 class_weights = torch.tensor([0.0481, 0.4213, 0.0392, 0.4079, 0.0262, 0.0305, 0.0100, 0.0614, 0.0544, 0.0010], dtype=torch.float32)
 
 # === DATA PIPELINE ===
 def rgb_to_mask(rgb_arr: np.ndarray, color_map: dict, num_classes: int) -> np.ndarray:
-    # 1. We flatten the RGB color dimensions
     H, W, _ = rgb_arr.shape
-    color_list = np.array(list(color_map.values()))
-    class_indices = list(color_map.keys())
+    colors = np.array(list(color_map.values()), dtype=np.float32)
+    classes = np.array(list(color_map.keys()), dtype=np.int64)
     
-    # 2. Use KDTree to rapidly evaluate nearest-neighbor colors avoiding weird interpolated artifacts
-    tree = KDTree(color_list)
-    reshaped = rgb_arr.reshape(-1, 3)
-    _, indices = tree.query(reshaped)
-    
-    # 3. Shape back into the required HxW tensor format
-    label_map = np.array([class_indices[i] for i in indices]).reshape(H, W)
-    return label_map
+    # Vectorized broadcasting is 1000x faster than KDTree in python for small color palettes
+    diff = rgb_arr[:, :, None, :] - colors[None, None, :, :]
+    dists = np.sum(diff ** 2, axis=-1)
+    min_idx = np.argmin(dists, axis=-1)
+    return classes[min_idx].astype(np.uint8)
 
 def mask_to_soft_edge(label_map: np.ndarray, num_classes: int) -> np.ndarray:
     edge_maps = []
@@ -282,7 +282,11 @@ class CustomDeepLabV3Plus(nn.Module):
 def soft_dice_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetConfig.NUM_CLASSES) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Phase 1: Generates smooth generalization boundaries allowing network to form general blobs cleanly."""
     pred = torch.clamp(F.softmax(pred_logits, 1), 1e-7, 1-1e-7)
-    hot = F.one_hot(target, c).permute(0,3,1,2).float()
+    
+    valid_mask = (target != 255).unsqueeze(1).float()
+    target_safe = torch.where(target == 255, torch.zeros_like(target), target)
+    hot = F.one_hot(target_safe, c).permute(0,3,1,2).float() * valid_mask
+    pred = pred * valid_mask
     
     # 1. Calculates the numerical areas
     i = torch.sum(pred * hot, (0,2,3))
@@ -299,9 +303,17 @@ def soft_dice_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=Datas
 def wce_standard(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetConfig.NUM_CLASSES) -> torch.Tensor:
     """Phase 1: Basic weighted soft cross entropy ensuring rare classes don't disappear."""
     pred = torch.clamp(F.softmax(pred_logits, 1), 1e-7, 1-1e-7)
-    hot = F.one_hot(target, c).permute(0,3,1,2).float()
+    
+    valid_mask = (target != 255).unsqueeze(1).float()
+    target_safe = torch.where(target == 255, torch.zeros_like(target), target)
+    hot = F.one_hot(target_safe, c).permute(0,3,1,2).float() * valid_mask
+    
     ce = -torch.sum((hot*0.95 + 0.05/c) * torch.log(pred), 1)
-    return torch.mean(class_weights.to(pred.device)[target] * ce)
+    
+    pixel_weights = class_weights.to(pred.device)[target_safe]
+    pixel_weights = pixel_weights * valid_mask.squeeze(1)
+    
+    return torch.sum(pixel_weights * ce) / (torch.sum(valid_mask) + 1e-6)
 
 # === PHASE 2 LOSS FUNCTIONS ===
 def lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
@@ -318,7 +330,11 @@ def lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
 def lovasz_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetConfig.NUM_CLASSES) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Phase 2: Chisel strict boundaries accurately computing the precise discrete IoU Jaccards."""
     pred = F.softmax(pred_logits, dim=1)
-    hot = F.one_hot(target, c).permute(0,3,1,2).float()
+    
+    valid_mask = (target != 255).unsqueeze(1).float()
+    target_safe = torch.where(target == 255, torch.zeros_like(target), target)
+    hot = F.one_hot(target_safe, c).permute(0,3,1,2).float() * valid_mask
+    pred = pred * valid_mask
     
     # We still need tracking metrics for the global loop feedback
     i = torch.sum(pred * hot, (0,2,3)).detach()
@@ -326,13 +342,14 @@ def lovasz_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetC
     
     C = pred.size(1)
     probas = pred.movedim(1, -1).reshape(-1, C)
-    labels = target.view(-1)
+    labels = target_safe.view(-1)
+    valid_flat = valid_mask.squeeze(1).view(-1)
     losses = []
     
     for cls in range(C):
-        fg = (labels == cls).float()
+        fg = (labels == cls).float() * valid_flat
         if fg.sum() == 0: continue
-        errors = (fg - probas[:, cls]).abs()
+        errors = (fg - probas[:, cls]).abs() * valid_flat
         
         # 1. Rank pixel failures absolutely directly instead of generally
         errors_sorted, perm = torch.sort(errors, 0, descending=True)
@@ -344,28 +361,40 @@ def lovasz_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetC
 def wce_ohem(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetConfig.NUM_CLASSES) -> torch.Tensor:
     """Phase 2: Punishes the model purely on the hardest 20% of pixels in the image."""
     pred = torch.clamp(F.softmax(pred_logits, 1), 1e-7, 1-1e-7)
-    hot = F.one_hot(target, c).permute(0,3,1,2).float()
-    ce = -torch.sum((hot*0.95 + 0.05/c) * torch.log(pred), 1)
-    pixel_loss = class_weights.to(pred.device)[target] * ce
     
-    # 1. Grab flat tensor array
-    num_pixels = pixel_loss.numel()
+    valid_mask = (target != 255).unsqueeze(1).float()
+    target_safe = torch.where(target == 255, torch.zeros_like(target), target)
+    hot = F.one_hot(target_safe, c).permute(0,3,1,2).float() * valid_mask
+    
+    ce = -torch.sum((hot*0.95 + 0.05/c) * torch.log(pred), 1)
+    pixel_loss = class_weights.to(pred.device)[target_safe] * ce * valid_mask.squeeze(1)
+    
+    # 1. Grab flat tensor array for valid pixels only
+    valid_pixels = pixel_loss[target != 255]
+    if valid_pixels.numel() == 0: return pred.sum() * 0.
     
     # 2. Locate exactly 20 percent integer mark
-    k = max(1, int(num_pixels * 0.20))
+    k = max(1, int(valid_pixels.numel() * 0.20))
     
     # 3. Discard the 80% successfully trained pixels computationally entirely
-    hard_losses, _ = torch.topk(pixel_loss.flatten(), k)
+    hard_losses, _ = torch.topk(valid_pixels, k)
     return torch.mean(hard_losses)
 
 def ftl(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetConfig.NUM_CLASSES) -> torch.Tensor:
     """Focal Tversky Loss computation enforcing structural pixel weights heavily avoiding rare-class degradation."""
     pred = torch.clamp(F.softmax(pred_logits, 1), 1e-6, 1.)
-    hot = F.one_hot(target, c).permute(0,3,1,2).float()
+    
+    valid_mask = (target != 255).unsqueeze(1).float()
+    target_safe = torch.where(target == 255, torch.zeros_like(target), target)
+    hot = F.one_hot(target_safe, c).permute(0,3,1,2).float() * valid_mask
+    pred = pred * valid_mask
+    
     tp = torch.sum(hot * pred, (1,2,3))
     fp = torch.sum((1-hot)*pred, (1,2,3))
     fn = torch.sum(hot*(1-pred), (1,2,3))
-    return torch.mean((1 - (tp+1e-6)/(tp+0.7*fp+0.3*fn+1e-6))**0.75)
+    tversky = (tp+1e-6)/(tp+0.7*fp+0.3*fn+1e-6)
+    # Prevent infinite gradients when tversky == 1.0
+    return torch.mean((torch.clamp(1.0 - tversky, min=1e-6))**0.75)
 
 def active_contour_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetConfig.NUM_CLASSES) -> torch.Tensor:
     """
@@ -373,7 +402,13 @@ def active_contour_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=
     Calculates physical contour differences vs Ground Truth mathematically using raw PyTorch convolution kernels.
     """
     pred = torch.clamp(F.softmax(pred_logits, 1), 1e-7, 1-1e-7)
-    hot = F.one_hot(target, c).permute(0,3,1,2).float()
+    
+    valid_mask = (target != 255).unsqueeze(1).float()
+    target_safe = torch.where(target == 255, torch.zeros_like(target), target)
+    hot = F.one_hot(target_safe, c).permute(0,3,1,2).float()
+    
+    # Erode the valid mask by 1 pixel to ignore artificial edges where 255 neighbors class 0
+    eroded_valid_mask = 1 - F.max_pool2d(1 - valid_mask, kernel_size=3, stride=1, padding=1)
     
     kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=pred.device).view(1, 1, 3, 3).repeat(c, 1, 1, 1)
     kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=pred.device).view(1, 1, 3, 3).repeat(c, 1, 1, 1)
@@ -387,23 +422,37 @@ def active_contour_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=
     gt_mag = torch.sqrt(gt_grad_x**2 + gt_grad_y**2 + 1e-6)
     
     # Punish the algorithm strictly for geometric mismatches on boundaries!
-    return F.l1_loss(pred_mag, gt_mag)
+    # Mask out invalid pixels AND their immediate neighbors before l1 loss
+    return F.l1_loss(pred_mag * eroded_valid_mask, gt_mag * eroded_valid_mask)
 
 
 # === EVALUATION ===
 @torch.no_grad()
 def multiscale_inference(model: nn.Module, image_tensor: torch.Tensor) -> torch.Tensor:
-    """Multi-Scale Testing (MST) Inference function for production evaluation routines."""
+    """Multi-Scale Testing (MST) and Test-Time Augmentation (TTA) Inference Engine."""
     model.eval()
     _, _, h, w = image_tensor.shape
-    scales = [0.5, 1.0, 1.5]
+    scales = [0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5]
+    scale_weights = [0.05, 0.10, 0.40, 0.15, 0.15, 0.10, 0.05]
+    
     fused_logits = torch.zeros((1, DatasetConfig.NUM_CLASSES, h, w), device=image_tensor.device)
-    for scale in scales:
+    
+    for scale, weight in zip(scales, scale_weights):
         scaled_size = (int(h * scale), int(w * scale))
-        scaled_img = F.interpolate(image_tensor, size=scaled_size, mode='bilinear', align_corners=False)
-        out = model(scaled_img)['main_output']
-        fused_logits += F.interpolate(out, size=(h, w), mode='bilinear', align_corners=False)
-    return fused_logits / len(scales)
+        scaled_img = F.interpolate(image_tensor, size=scaled_size, mode='bicubic', align_corners=False)
+        
+        # 1. Standard Forward Pass
+        out_standard = model(scaled_img)['main_output']
+        fused_logits += F.interpolate(out_standard, size=(h, w), mode='bicubic', align_corners=False) * weight
+        
+        # 2. TTA Forward Pass (Horizontal Flip)
+        scaled_img_flipped_h = torch.flip(scaled_img, dims=[3])
+        out_flipped_h = model(scaled_img_flipped_h)['main_output']
+        out_unflipped_h = torch.flip(out_flipped_h, dims=[3])
+        fused_logits += F.interpolate(out_unflipped_h, size=(h, w), mode='bicubic', align_corners=False) * weight
+        
+    # Divided by 2 because we did standard + flip_h. The scale_weights sum to 1.0.
+    return fused_logits / 2.0
 
 
 # === TRAINING LOOP ===
@@ -413,6 +462,16 @@ def train_loop():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = CustomDeepLabV3Plus(num_classes=DatasetConfig.NUM_CLASSES).to(device)
     
+    # Auto-Resume Logic
+    best_ckpt = os.path.join(TrainingConfig.CHECKPOINT_DIR, "best_deeplab_weights.pt")
+    if os.path.exists(best_ckpt):
+        logger.info(f"Found existing checkpoint. Resuming DeepLab from: {best_ckpt}")
+        try:
+            state_dict = torch.load(best_ckpt, map_location=device, weights_only=True)
+            model.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state_dict.items()})
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint: {e}")
+            
     # 1. LAYER-WISE LEARNING RATE DECAY (LLRD)
     # We strip backbone params separately to protect ImageNet features initially
     backbone_params, decoder_params = [], []
@@ -436,9 +495,18 @@ def train_loop():
     tr_img = sorted(glob.glob(os.path.join(DatasetConfig.TRAIN_IMG_DIR, "*.jpg")))
     tr_msk = sorted(glob.glob(os.path.join(DatasetConfig.TRAIN_MSK_DIR, "*.png")))
     
+    ps_img = sorted(glob.glob(os.path.join(TrainingConfig.PSEUDO_IMG_DIR, "*.jpg")))
+    ps_msk = sorted(glob.glob(os.path.join(TrainingConfig.PSEUDO_MSK_DIR, "*.png")))
+    
+    # Inject pseudo-labeled test dataset into training mix
+    if len(ps_msk) > 0:
+        logger.info(f"Injecting {len(ps_msk)} high-confidence pseudo-masks into training!")
+        tr_img.extend(ps_img)
+        tr_msk.extend(ps_msk)
+    
     loader = DataLoader(
         FloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color), 
-        batch_size=TrainingConfig.BATCH_SIZE, shuffle=True, 
+        batch_size=TrainingConfig.BATCH_SIZE, shuffle=True, drop_last=True,
         num_workers=8, pin_memory=True, persistent_workers=True
     )
     
@@ -479,17 +547,22 @@ def train_loop():
             t_hard_i = torch.zeros(DatasetConfig.NUM_CLASSES, device=device)
             t_hard_u = torch.zeros(DatasetConfig.NUM_CLASSES, device=device)
             
+            optimizer.zero_grad(set_to_none=True)
             for b_idx, (im, tgts) in enumerate(loader):
+                # Enable Gradient Accumulation for massive backbones
+                is_accum_step = ((b_idx + 1) % TrainingConfig.GRAD_ACCUMULATION_STEPS == 0) or ((b_idx + 1) == len(loader))
+                
                 im = im.to(device, non_blocking=True)
                 mt = tgts['main_output'].to(device, non_blocking=True)
                 et = tgts['edge_output'].to(device, non_blocking=True)
-                
-                optimizer.zero_grad(set_to_none=True)
                 
                 with torch.amp.autocast('cuda', enabled=False): # DISABLED: AMD ROCm FP16 hardware crash
                     o = model(im)
                     
                     # 6. ROUTER EQUATION LOGIC
+                    edge_valid_mask = (mt != 255).unsqueeze(1).float()
+                    edge_eroded_mask = 1 - F.max_pool2d(1 - edge_valid_mask, kernel_size=3, stride=1, padding=1)
+                    
                     if not is_phase_2:
                         dl, intersection, union = soft_dice_loss(o['main_output'], mt)
                         main_wce = wce_standard(o['main_output'], mt)
@@ -497,7 +570,7 @@ def train_loop():
                         # Phase 1 uses traditional 1-to-1 Keras metrics globally
                         loss = (0.2 * main_wce + 0.3 * ftl(o['main_output'], mt) + 0.5 * dl + 
                                 0.5 * active_contour_loss(o['main_output'], mt) +
-                                0.2 * F.binary_cross_entropy_with_logits(o['edge_output'], et) + 
+                                0.2 * F.binary_cross_entropy_with_logits(o['edge_output'], et, weight=edge_eroded_mask) + 
                                 0.5 * wce_standard(o['side_output'], mt) + 0.2 * wce_standard(o['high_output'], mt) + 
                                 0.2 * wce_standard(o['mid_high_output'], mt) + 0.2 * wce_standard(o['mid_output'], mt) + 0.2 * wce_standard(o['low_output'], mt))
                     else:
@@ -508,20 +581,29 @@ def train_loop():
                         # Also shifts Lovasz power from 0.5 to 0.6 while dropping OHEM priority.
                         loss = (0.1 * main_wce + 0.3 * ftl(o['main_output'], mt) + 0.6 * dl + 
                                 0.5 * active_contour_loss(o['main_output'], mt) +
-                                0.2 * F.binary_cross_entropy_with_logits(o['edge_output'], et) + 
+                                0.2 * F.binary_cross_entropy_with_logits(o['edge_output'], et, weight=edge_eroded_mask) + 
                                 0.5 * wce_standard(o['side_output'], mt) + 0.2 * wce_standard(o['high_output'], mt) + 
                                 0.2 * wce_standard(o['mid_high_output'], mt) + 0.2 * wce_standard(o['mid_output'], mt) + 0.2 * wce_standard(o['low_output'], mt))
                 
-                # 7. SCALE AND EXECUTE DECAYS
+                # 7. SCALE AND EXECUTE DECAYS (Gradient Accumulation)
+                loss = loss / TrainingConfig.GRAD_ACCUMULATION_STEPS
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                
+                if is_accum_step:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
                 
                 # Hard-Dice tracking (Argmax categorical true overlap)
                 with torch.no_grad():
                     pred_labels = torch.argmax(o['main_output'], dim=1)
                     hard_pred = F.one_hot(pred_labels, DatasetConfig.NUM_CLASSES).permute(0,3,1,2).float()
-                    hard_true = F.one_hot(mt, DatasetConfig.NUM_CLASSES).permute(0,3,1,2).float()
+                    
+                    valid_mask_hard = (mt != 255).unsqueeze(1).float()
+                    mt_safe = torch.where(mt == 255, torch.zeros_like(mt), mt)
+                    hard_true = F.one_hot(mt_safe, DatasetConfig.NUM_CLASSES).permute(0,3,1,2).float() * valid_mask_hard
+                    hard_pred = hard_pred * valid_mask_hard
+                    
                     hard_i = torch.sum(hard_pred * hard_true, (0,2,3))
                     hard_u = torch.sum(hard_pred + hard_true, (0,2,3))
                     
@@ -564,8 +646,16 @@ def train_loop():
         torch.save(model.state_dict(), os.path.join(TrainingConfig.CHECKPOINT_DIR, "interrupted_weights.pt"))
         
     finally:
-        logger.info("Executing SWA Validation Updates...")
-        torch.optim.swa_utils.update_bn(loader, swa_model, device=device)
+        logger.info("Executing SWA Validation Updates on Pristine Data...")
+        
+        # SWA BUG FIX: Create an un-augmented loader so BatchNorm layers don't memorize geometric noise!
+        clean_swa_loader = DataLoader(
+            FloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color, apply_aug=False), 
+            batch_size=TrainingConfig.BATCH_SIZE, shuffle=False, drop_last=False,
+            num_workers=8, pin_memory=True
+        )
+        
+        torch.optim.swa_utils.update_bn(clean_swa_loader, swa_model, device=device)
         torch.save(swa_model.state_dict(), os.path.join(TrainingConfig.CHECKPOINT_DIR, "final_swa_smoothed_weights.pt"))
         writer.close()
         logger.info("SWA parameters flushed to disk. Terminating.")

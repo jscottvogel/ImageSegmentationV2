@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 
 class DoubleConv(nn.Module):
     """(Conv2d => BatchNorm => ReLU) * 2"""
@@ -18,70 +19,61 @@ class DoubleConv(nn.Module):
     def forward(self, x):
         return self.double_conv(x)
 
-class Down(nn.Module):
-    """Downscaling with MaxPool2d then DoubleConv"""
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(in_channels, out_channels)
-        )
-
-    def forward(self, x):
-        return self.maxpool_conv(x)
-
 class Up(nn.Module):
-    """Upscaling then double conv"""
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels_x1, in_channels_x2, out_channels):
         super().__init__()
-        self.up = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
-        )
-        self.conv = DoubleConv(in_channels, out_channels)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv = DoubleConv(in_channels_x1 + in_channels_x2, out_channels)
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
-        # Pad differences automatically if dataset sizing produces rounding gaps
         diffY = x2.size()[2] - x1.size()[2]
         diffX = x2.size()[3] - x1.size()[3]
         x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-        
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
 class StandardUNet(nn.Module):
     """
-    Standard Enterprise UNet Implementation natively targeting Image Segmentation without Spatial Degradation.
+    Enterprise UNet Implementation targeting Image Segmentation with EfficientNetV2 Backbone.
     """
-    def __init__(self, n_channels=3, num_classes=10):
-        super(StandardUNet, self).__init__()
-        self.n_channels = n_channels
+    def __init__(self, num_classes=10):
+        super().__init__()
         self.num_classes = num_classes
 
-        self.inc = DoubleConv(n_channels, 64)
-        self.down1 = Down(64, 128)
-        self.down2 = Down(128, 256)
-        self.down3 = Down(256, 512)
-        self.down4 = Down(512, 1024)
-        self.up1 = Up(1024, 512)
-        self.up2 = Up(512, 256)
-        self.up3 = Up(256, 128)
-        self.up4 = Up(128, 64)
-        self.outc = nn.Conv2d(64, num_classes, kernel_size=1)
+        # Pre-trained ImageNet Encoder for high DICE
+        self.backbone = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.IMAGENET1K_V1).features
+        
+        # Layer 1: 24 channels (1/2 scale)
+        # Layer 2: 48 channels (1/4 scale)
+        # Layer 3: 64 channels (1/8 scale)
+        # Layer 5: 160 channels (1/16 scale)
+        # Layer 7: 1280 channels (1/32 scale)
+
+        self.up1 = Up(1280, 160, 512)
+        self.up2 = Up(512, 64, 256)
+        self.up3 = Up(256, 48, 128)
+        self.up4 = Up(128, 24, 64)
+        
+        self.up5 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            DoubleConv(64, 32)
+        )
+        self.outc = nn.Conv2d(32, num_classes, kernel_size=1)
 
     def forward(self, x):
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
+        features = []
+        for i, m in enumerate(self.backbone):
+            x = m(x)
+            if i in [1, 2, 3, 5, 7]:
+                features.append(x)
+                
+        # features[4] = 1/32, features[3] = 1/16, etc.
+        x = self.up1(features[4], features[3])
+        x = self.up2(x, features[2])
+        x = self.up3(x, features[1])
+        x = self.up4(x, features[0])
+        x = self.up5(x)
         
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
         logits = self.outc(x)
-        
-        # Wrapped functionally matching DeepLab pipeline expectations structurally
         return {'main_output': logits}

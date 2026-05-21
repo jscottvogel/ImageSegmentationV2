@@ -215,6 +215,7 @@ def train_loop():
     print(f"Training for {TrainingConfig.EPOCHS} Epochs on {len(tr_img)} images...")
     
     try:
+        pass
         # model = torch.compile(model) # DISABLED: AMD ROCm hardware crash on FP16/Triton
     except Exception:
         pass
