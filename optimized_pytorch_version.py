@@ -18,6 +18,7 @@ Standard Execution:
 
 # === IMPORTS ===
 import os
+os.environ["MIOPEN_LOG_LEVEL"] = "3"  # Silence noisy MIOpen warnings to prevent log flooding
 import glob
 import random
 import logging
@@ -64,6 +65,7 @@ class TrainingConfig:
     LOG_INTERVAL: int = 25
     PSEUDO_IMG_DIR: str = "/home/fred/Downloads/opencv-tf-project-3-image-segmentation-round-2/Project_3_FloodNet_Dataset/test/images"
     PSEUDO_MSK_DIR: str = "confident_pseudo_masks"
+    USE_PSEUDO_LABELS: bool = False
 
 id2color: Dict[int, List[int]] = {
     0: [0, 0, 0], 1: [255, 0, 0], 2: [200, 90, 90], 3: [128, 128, 0], 4: [155, 155, 155],
@@ -267,9 +269,12 @@ class CustomDeepLabV3Plus(nn.Module):
         h = F.interpolate(mid, size=fs['low'].shape[-2:], mode='bilinear', align_corners=False)
         low = self.fuse_low(torch.cat([h, self.low_conv(fs['low'])], 1))
         
+        ref_feats = self.final_refine(low)
+        
         # 4. Generate identical scale dictionaries explicitly matching original outputs
         return {
-            'main_output': F.interpolate(self.main_head(self.final_refine(low)), size=insz, mode='bilinear', align_corners=False),
+            'main_output': F.interpolate(self.main_head(ref_feats), size=insz, mode='bilinear', align_corners=False),
+            'features': ref_feats,
             'edge_output': F.interpolate(self.edge_head(self.edge_proj(fs['low'])), size=insz, mode='bilinear', align_corners=False),
             'side_output': F.interpolate(self.side_head(aspp), size=insz, mode='bilinear', align_corners=False),
             'high_output': F.interpolate(self.high_head(high), size=insz, mode='bilinear', align_corners=False),
@@ -302,18 +307,8 @@ def soft_dice_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=Datas
 
 def wce_standard(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetConfig.NUM_CLASSES) -> torch.Tensor:
     """Phase 1: Basic weighted soft cross entropy ensuring rare classes don't disappear."""
-    pred = torch.clamp(F.softmax(pred_logits, 1), 1e-7, 1-1e-7)
-    
-    valid_mask = (target != 255).unsqueeze(1).float()
-    target_safe = torch.where(target == 255, torch.zeros_like(target), target)
-    hot = F.one_hot(target_safe, c).permute(0,3,1,2).float() * valid_mask
-    
-    ce = -torch.sum((hot*0.95 + 0.05/c) * torch.log(pred), 1)
-    
-    pixel_weights = class_weights.to(pred.device)[target_safe]
-    pixel_weights = pixel_weights * valid_mask.squeeze(1)
-    
-    return torch.sum(pixel_weights * ce) / (torch.sum(valid_mask) + 1e-6)
+    cw = class_weights.to(pred_logits.device)
+    return F.cross_entropy(pred_logits, target, weight=cw, label_smoothing=0.05, ignore_index=255)
 
 # === PHASE 2 LOSS FUNCTIONS ===
 def lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
@@ -329,10 +324,15 @@ def lovasz_grad(gt_sorted: torch.Tensor) -> torch.Tensor:
 
 def lovasz_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetConfig.NUM_CLASSES) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Phase 2: Chisel strict boundaries accurately computing the precise discrete IoU Jaccards."""
-    pred = F.softmax(pred_logits, dim=1)
+    # Memory optimization: downsample inputs by 2x to reduce Lovasz sorting memory overhead by 4x
+    h, w = pred_logits.shape[-2:]
+    pred_logits_down = F.interpolate(pred_logits, size=(h // 2, w // 2), mode='bilinear', align_corners=False)
+    target_down = F.interpolate(target.unsqueeze(1).float(), size=(h // 2, w // 2), mode='nearest').squeeze(1).long()
     
-    valid_mask = (target != 255).unsqueeze(1).float()
-    target_safe = torch.where(target == 255, torch.zeros_like(target), target)
+    pred = F.softmax(pred_logits_down, dim=1)
+    
+    valid_mask = (target_down != 255).unsqueeze(1).float()
+    target_safe = torch.where(target_down == 255, torch.zeros_like(target_down), target_down)
     hot = F.one_hot(target_safe, c).permute(0,3,1,2).float() * valid_mask
     pred = pred * valid_mask
     
@@ -358,25 +358,15 @@ def lovasz_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetC
     l_loss = torch.mean(torch.stack(losses)) if losses else pred.sum() * 0.
     return l_loss, i, u
 
+
 def wce_ohem(pred_logits: torch.Tensor, target: torch.Tensor, c: int=DatasetConfig.NUM_CLASSES) -> torch.Tensor:
     """Phase 2: Punishes the model purely on the hardest 20% of pixels in the image."""
-    pred = torch.clamp(F.softmax(pred_logits, 1), 1e-7, 1-1e-7)
-    
-    valid_mask = (target != 255).unsqueeze(1).float()
-    target_safe = torch.where(target == 255, torch.zeros_like(target), target)
-    hot = F.one_hot(target_safe, c).permute(0,3,1,2).float() * valid_mask
-    
-    ce = -torch.sum((hot*0.95 + 0.05/c) * torch.log(pred), 1)
-    pixel_loss = class_weights.to(pred.device)[target_safe] * ce * valid_mask.squeeze(1)
-    
-    # 1. Grab flat tensor array for valid pixels only
+    cw = class_weights.to(pred_logits.device)
+    pixel_loss = F.cross_entropy(pred_logits, target, weight=cw, label_smoothing=0.05, ignore_index=255, reduction='none')
     valid_pixels = pixel_loss[target != 255]
-    if valid_pixels.numel() == 0: return pred.sum() * 0.
-    
-    # 2. Locate exactly 20 percent integer mark
+    if valid_pixels.numel() == 0:
+        return pred_logits.sum() * 0.
     k = max(1, int(valid_pixels.numel() * 0.20))
-    
-    # 3. Discard the 80% successfully trained pixels computationally entirely
     hard_losses, _ = torch.topk(valid_pixels, k)
     return torch.mean(hard_losses)
 
@@ -404,23 +394,24 @@ def active_contour_loss(pred_logits: torch.Tensor, target: torch.Tensor, c: int=
     pred = torch.clamp(F.softmax(pred_logits, 1), 1e-7, 1-1e-7)
     
     valid_mask = (target != 255).unsqueeze(1).float()
-    target_safe = torch.where(target == 255, torch.zeros_like(target), target)
-    hot = F.one_hot(target_safe, c).permute(0,3,1,2).float()
     
     # Erode the valid mask by 1 pixel to ignore artificial edges where 255 neighbors class 0
     eroded_valid_mask = 1 - F.max_pool2d(1 - valid_mask, kernel_size=3, stride=1, padding=1)
     
-    kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=pred.device).view(1, 1, 3, 3).repeat(c, 1, 1, 1)
-    kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=pred.device).view(1, 1, 3, 3).repeat(c, 1, 1, 1)
+    kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3).repeat(c, 1, 1, 1)
+    kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3).repeat(c, 1, 1, 1)
     
     pred_grad_x = F.conv2d(pred, kernel_x, padding=1, groups=c)
     pred_grad_y = F.conv2d(pred, kernel_y, padding=1, groups=c)
     pred_mag = torch.sqrt(pred_grad_x**2 + pred_grad_y**2 + 1e-6)
     
-    gt_grad_x = F.conv2d(hot, kernel_x, padding=1, groups=c)
-    gt_grad_y = F.conv2d(hot, kernel_y, padding=1, groups=c)
-    gt_mag = torch.sqrt(gt_grad_x**2 + gt_grad_y**2 + 1e-6)
-    
+    with torch.no_grad():
+        target_safe = torch.where(target == 255, 0, target)
+        hot = F.one_hot(target_safe, c).permute(0,3,1,2).to(pred.dtype)
+        gt_grad_x = F.conv2d(hot, kernel_x, padding=1, groups=c)
+        gt_grad_y = F.conv2d(hot, kernel_y, padding=1, groups=c)
+        gt_mag = torch.sqrt(gt_grad_x**2 + gt_grad_y**2 + 1e-6)
+        
     # Punish the algorithm strictly for geometric mismatches on boundaries!
     # Mask out invalid pixels AND their immediate neighbors before l1 loss
     return F.l1_loss(pred_mag * eroded_valid_mask, gt_mag * eroded_valid_mask)
@@ -435,24 +426,35 @@ def multiscale_inference(model: nn.Module, image_tensor: torch.Tensor) -> torch.
     scales = [0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5]
     scale_weights = [0.05, 0.10, 0.40, 0.15, 0.15, 0.10, 0.05]
     
-    fused_logits = torch.zeros((1, DatasetConfig.NUM_CLASSES, h, w), device=image_tensor.device)
+    # Accumulate logits on CPU to prevent GPU-side interpolation errors
+    fused_logits = torch.zeros((1, DatasetConfig.NUM_CLASSES, h, w), device='cpu')
+    
+    image_tensor_cpu = image_tensor.cpu()
     
     for scale, weight in zip(scales, scale_weights):
         scaled_size = (int(h * scale), int(w * scale))
-        scaled_img = F.interpolate(image_tensor, size=scaled_size, mode='bicubic', align_corners=False)
+        
+        # CPU scale
+        scaled_img_cpu = F.interpolate(image_tensor_cpu, size=scaled_size, mode='bilinear', align_corners=False)
+        scaled_img = scaled_img_cpu.to(image_tensor.device)
         
         # 1. Standard Forward Pass
-        out_standard = model(scaled_img)['main_output']
-        fused_logits += F.interpolate(out_standard, size=(h, w), mode='bicubic', align_corners=False) * weight
+        out_standard = model(scaled_img)
+        if isinstance(out_standard, dict):
+            out_standard = out_standard['main_output']
+        out_standard_cpu = out_standard.cpu()
+        fused_logits += F.interpolate(out_standard_cpu, size=(h, w), mode='bilinear', align_corners=False) * weight * 0.5
         
         # 2. TTA Forward Pass (Horizontal Flip)
         scaled_img_flipped_h = torch.flip(scaled_img, dims=[3])
-        out_flipped_h = model(scaled_img_flipped_h)['main_output']
-        out_unflipped_h = torch.flip(out_flipped_h, dims=[3])
-        fused_logits += F.interpolate(out_unflipped_h, size=(h, w), mode='bicubic', align_corners=False) * weight
+        out_flipped_h = model(scaled_img_flipped_h)
+        if isinstance(out_flipped_h, dict):
+            out_flipped_h = out_flipped_h['main_output']
+        out_flipped_h_cpu = out_flipped_h.cpu()
+        out_unflipped_h_cpu = torch.flip(out_flipped_h_cpu, dims=[3])
+        fused_logits += F.interpolate(out_unflipped_h_cpu, size=(h, w), mode='bilinear', align_corners=False) * weight * 0.5
         
-    # Divided by 2 because we did standard + flip_h. The scale_weights sum to 1.0.
-    return fused_logits / 2.0
+    return fused_logits.to(image_tensor.device)
 
 
 # === TRAINING LOOP ===
@@ -499,7 +501,7 @@ def train_loop():
     ps_msk = sorted(glob.glob(os.path.join(TrainingConfig.PSEUDO_MSK_DIR, "*.png")))
     
     # Inject pseudo-labeled test dataset into training mix
-    if len(ps_msk) > 0:
+    if TrainingConfig.USE_PSEUDO_LABELS and len(ps_msk) > 0:
         logger.info(f"Injecting {len(ps_msk)} high-confidence pseudo-masks into training!")
         tr_img.extend(ps_img)
         tr_msk.extend(ps_msk)
@@ -507,7 +509,7 @@ def train_loop():
     loader = DataLoader(
         FloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color), 
         batch_size=TrainingConfig.BATCH_SIZE, shuffle=True, drop_last=True,
-        num_workers=8, pin_memory=True, persistent_workers=True
+        num_workers=2, pin_memory=True, persistent_workers=True
     )
     
     logger.info(f"Loaded {len(tr_img)} images. Phase-2 Transition sets at Epoch {TrainingConfig.ROUTER_EPOCH}.")
@@ -652,7 +654,7 @@ def train_loop():
         clean_swa_loader = DataLoader(
             FloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color, apply_aug=False), 
             batch_size=TrainingConfig.BATCH_SIZE, shuffle=False, drop_last=False,
-            num_workers=8, pin_memory=True
+            num_workers=2, pin_memory=True
         )
         
         torch.optim.swa_utils.update_bn(clean_swa_loader, swa_model, device=device)

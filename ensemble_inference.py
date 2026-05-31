@@ -1,5 +1,6 @@
 import os
 os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
+os.environ["MIOPEN_LOG_LEVEL"] = "3"  # Silence noisy MIOpen warnings to prevent log flooding
 import glob
 import cv2
 import torch
@@ -8,6 +9,23 @@ import pandas as pd
 import torch.nn.functional as F
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+
+@torch.no_grad()
+def multiscale_inference(model, image_tensor):
+    model.eval()
+    # Standard Forward Pass
+    out_std = model(image_tensor)
+    if isinstance(out_std, dict):
+        out_std = out_std['main_output']
+    
+    # Horizontal Flip Pass
+    img_flipped = torch.flip(image_tensor, dims=[3])
+    out_flip = model(img_flipped)
+    if isinstance(out_flip, dict):
+        out_flip = out_flip['main_output']
+    out_unflipped = torch.flip(out_flip, dims=[3])
+    
+    return (out_std + out_unflipped) / 2.0
 
 from rfdetr_version import DenseTransformerSegmentation
 id2color = {
@@ -31,8 +49,9 @@ def mask2rle(img: np.ndarray) -> str:
     """Highly optimized RLE encoder translating dense pixel matrices to Kaggle submission formats."""
     pixels = img.T.flatten()
     pixels = np.concatenate([[0], pixels, [0]])
-    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs = np.where(pixels[1:] != pixels[:-1])[0]
     runs[1::2] -= runs[::2]
+    runs[::2] += 1
     return ' '.join(str(x) for x in runs)
 
 def safe_morphological_cleanup(pred_labels: np.ndarray, min_area=25) -> np.ndarray:
@@ -69,7 +88,7 @@ def ensemble_generate_submission():
     
     # 1. BASELINE CNN (DeepLabV3+ with ASAPP) - [STATUS: OPTIMIZED]
     try:
-        from optimized_pytorch_version import CustomDeepLabV3Plus, DatasetConfig as Config_DL, TrainingConfig as Train_DL, multiscale_inference
+        from optimized_pytorch_version import CustomDeepLabV3Plus, DatasetConfig as Config_DL, TrainingConfig as Train_DL
         model_cnn = CustomDeepLabV3Plus(num_classes=Config_DL.NUM_CLASSES).to(device)
         # Disabled torch.compile() globally to prevent AMD ROCm hardware crashes
         # try:
@@ -201,13 +220,15 @@ def ensemble_generate_submission():
             for model_name, model_eval_func, weight in models_to_ensemble:
                 fused_ensemble_probs += model_eval_func(img_tensor) * (weight / total_weight)
             
-            # Snap dimensions exactly back to the physical pixels native to drone using Bilinear interpolation
-            # (Bicubic can overshoot [0,1] probability bounds and cause prediction artifacts)
-            logits_reshaped = F.interpolate(fused_ensemble_probs, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
-            pred_labels = torch.argmax(logits_reshaped, dim=1).squeeze().cpu().numpy().astype(np.uint8)
+            # CPU Interpolation optimization to save 600MB VRAM per step
+            probs_cpu = fused_ensemble_probs.squeeze(0).cpu().numpy()
+            probs_resized = np.zeros((10, orig_h, orig_w), dtype=np.float32)
+            for c in range(10):
+                probs_resized[c] = cv2.resize(probs_cpu[c], (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            pred_labels = np.argmax(probs_resized, axis=0).astype(np.uint8)
             
             # KAGGLE GRANDMASTER LEVER: Obliterate isolated false-positive microscopic pixels
-            # pred_labels = safe_morphological_cleanup(pred_labels, min_area=40)
+            pred_labels = safe_morphological_cleanup(pred_labels, min_area=50)
             
             
         for class_id in range(Config_DL.NUM_CLASSES):
@@ -225,7 +246,7 @@ def ensemble_generate_submission():
             mask_path = img_path.replace('images', 'masks').replace('.jpg', '.png')
             has_gt = os.path.exists(mask_path)
             
-            plt.figure(figsize=(18, 6))
+            fig = plt.figure(figsize=(18, 6))
             
             plt.subplot(1, 3, 1)
             plt.imshow(base_img)
@@ -250,7 +271,12 @@ def ensemble_generate_submission():
             
             plt.tight_layout()
             plt.savefig(f"visualizations/blend_check_{filename}.jpg", bbox_inches='tight')
-            plt.close()
+            fig.clf()
+            plt.close(fig)
+            
+        # Free GPU memory and empty cache
+        torch.cuda.empty_cache()
+        import gc; gc.collect()
             
     print("Writing hybridized structural blocks to hard-drive CSV...")
     submission_df = pd.DataFrame(submission_data, columns=["IMG_ID", "EncodedString"])

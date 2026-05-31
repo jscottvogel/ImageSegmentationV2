@@ -1,5 +1,6 @@
 import os
 os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
+os.environ["MIOPEN_LOG_LEVEL"] = "3"  # Silence noisy MIOpen warnings to prevent log flooding
 import glob
 import cv2
 import torch
@@ -37,8 +38,9 @@ def decode_segmap(image, nc=10):
 def mask2rle(img: np.ndarray) -> str:
     pixels = img.T.flatten()
     pixels = np.concatenate([[0], pixels, [0]])
-    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs = np.where(pixels[1:] != pixels[:-1])[0]
     runs[1::2] -= runs[::2]
+    runs[::2] += 1
     return ' '.join(str(x) for x in runs)
 
 def run_meta_inference():
@@ -99,9 +101,14 @@ def run_meta_inference():
         with torch.no_grad():
             # The Meta-Learner handles dynamically blending all 3 networks based on its learned 1x1 spatial confidence
             fused_logits = meta_model(img_tensor)
+            # Softmax to get probabilities (since F.interpolate on logits is equal, but doing it on probabilities makes the CPU resizing consistent)
+            fused_probs = F.softmax(fused_logits, dim=1)
+            probs_cpu = fused_probs.squeeze(0).cpu().numpy()
             
-            logits_reshaped = F.interpolate(fused_logits, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
-            pred_labels = torch.argmax(logits_reshaped, dim=1).squeeze().cpu().numpy().astype(np.uint8)
+            probs_resized = np.zeros((10, orig_h, orig_w), dtype=np.float32)
+            for c in range(10):
+                probs_resized[c] = cv2.resize(probs_cpu[c], (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            pred_labels = np.argmax(probs_resized, axis=0).astype(np.uint8)
             
         for class_id in range(Config_DL.NUM_CLASSES):
             binary_mask = (pred_labels == class_id).astype(np.uint8)
@@ -112,7 +119,7 @@ def run_meta_inference():
             mask_path = img_path.replace('images', 'masks').replace('.jpg', '.png')
             has_gt = os.path.exists(mask_path)
             
-            plt.figure(figsize=(18, 6))
+            fig = plt.figure(figsize=(18, 6))
             plt.subplot(1, 3, 1)
             plt.imshow(base_img)
             plt.title(f"Original: {filename}")
@@ -133,7 +140,12 @@ def run_meta_inference():
             
             plt.tight_layout()
             plt.savefig(f"visualizations_meta/blend_check_{filename}.jpg", bbox_inches='tight')
-            plt.close()
+            fig.clf()
+            plt.close(fig)
+            
+        # Free GPU memory and empty cache
+        torch.cuda.empty_cache()
+        import gc; gc.collect()
             
     submission_df = pd.DataFrame(submission_data, columns=["IMG_ID", "EncodedString"])
     submission_df.to_csv(SUBMISSION_PATH, index=False)

@@ -2,6 +2,9 @@ import os
 os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
 import cv2
 cv2.setNumThreads(0)
+import torch
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.enabled = False
 from standard_training_loop import run_standard_training
 from fcn_version import ResNet50FCN
 

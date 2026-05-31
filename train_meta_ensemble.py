@@ -1,7 +1,10 @@
 import os
 os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
+os.environ["MIOPEN_LOG_LEVEL"] = "3"  # Silence noisy MIOpen warnings to prevent log flooding
 import glob
 import torch
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.enabled = False
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -103,13 +106,13 @@ def train_meta():
     tr_img = sorted(glob.glob(os.path.join(DatasetConfig.TRAIN_IMG_DIR, "*.jpg")))
     tr_msk = sorted(glob.glob(os.path.join(DatasetConfig.TRAIN_MSK_DIR, "*.png")))
     
-    ps_img = sorted(glob.glob(os.path.join("/home/fred/Downloads/opencv-tf-project-3-image-segmentation-round-2/Project_3_FloodNet_Dataset/test/images", "*.jpg")))
-    ps_msk = sorted(glob.glob(os.path.join("confident_pseudo_masks", "*.png")))
-    
-    if len(ps_msk) > 0:
-        print(f"Injecting {len(ps_msk)} high-confidence pseudo-masks into meta-training!")
-        tr_img.extend(ps_img)
-        tr_msk.extend(ps_msk)
+    # ps_img = sorted(glob.glob(os.path.join("/home/fred/Downloads/opencv-tf-project-3-image-segmentation-round-2/Project_3_FloodNet_Dataset/test/images", "*.jpg")))
+    # ps_msk = sorted(glob.glob(os.path.join("confident_pseudo_masks", "*.png")))
+    # 
+    # if len(ps_msk) > 0:
+    #     print(f"Injecting {len(ps_msk)} high-confidence pseudo-masks into meta-training!")
+    #     tr_img.extend(ps_img)
+    #     tr_msk.extend(ps_msk)
         
     # Zip and shuffle with fixed seed to select 300 representative samples
     combined = list(zip(tr_img, tr_msk))
@@ -123,7 +126,7 @@ def train_meta():
     print(f"Subsampled to {len(tr_img_sub)} images for fast meta-training.")
     dataset = MetaDataset(tr_img_sub, tr_msk_sub, DatasetConfig.NUM_CLASSES, id2color, apply_aug=False, use_mosaic=False)
     # Use batch size 4 for speed and memory stability (fits 12GB VRAM easily)
-    loader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=8)
+    loader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=2)
     
     # 4. Train only the meta layer
     optimizer = torch.optim.AdamW(meta_model.meta_layer.parameters(), lr=0.001)

@@ -1,4 +1,5 @@
 import os
+os.environ["MIOPEN_LOG_LEVEL"] = "3"  # Silence noisy MIOpen warnings to prevent log flooding
 import torch
 import glob
 import logging
@@ -70,13 +71,13 @@ def run_standard_training(model_name, model_fn, get_backbone_fn, log_file_name, 
     ps_img = sorted(glob.glob(os.path.join(TrainingConfig.PSEUDO_IMG_DIR, "*.jpg")))
     ps_msk = sorted(glob.glob(os.path.join(TrainingConfig.PSEUDO_MSK_DIR, "*.png")))
     
-    if len(ps_msk) > 0:
+    if TrainingConfig.USE_PSEUDO_LABELS and len(ps_msk) > 0:
         logger.info(f"Injecting {len(ps_msk)} high-confidence pseudo-masks into {model_name} training!")
         tr_img.extend(ps_img)
         tr_msk.extend(ps_msk)
     
     dataset = FloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color)
-    loader = DataLoader(dataset, batch_size=TrainingConfig.BATCH_SIZE, shuffle=True, drop_last=True, num_workers=4, pin_memory=True, persistent_workers=True)
+    loader = DataLoader(dataset, batch_size=TrainingConfig.BATCH_SIZE, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, persistent_workers=True)
     
     writer = SummaryWriter(log_dir=f"{checkpoint_dir}/tensorboard")
     best_dice = 0.0
@@ -193,7 +194,7 @@ def run_standard_training(model_name, model_fn, get_backbone_fn, log_file_name, 
         
         clean_swa_loader = DataLoader(
             FloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color, apply_aug=False), 
-            batch_size=TrainingConfig.BATCH_SIZE, shuffle=False, drop_last=False, num_workers=4, pin_memory=True
+            batch_size=TrainingConfig.BATCH_SIZE, shuffle=False, drop_last=False, num_workers=2, pin_memory=True
         )
         
         torch.optim.swa_utils.update_bn(clean_swa_loader, swa_model, device=device)

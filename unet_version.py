@@ -60,8 +60,16 @@ class StandardUNet(nn.Module):
             DoubleConv(64, 32)
         )
         self.outc = nn.Conv2d(32, num_classes, kernel_size=1)
+        
+        # Auxiliary heads for consistent multi-scale training
+        self.side_head = nn.Conv2d(1280, num_classes, kernel_size=1)
+        self.high_head = nn.Conv2d(512, num_classes, kernel_size=1)
+        self.mid_high_head = nn.Conv2d(256, num_classes, kernel_size=1)
+        self.mid_head = nn.Conv2d(128, num_classes, kernel_size=1)
+        self.low_head = nn.Conv2d(64, num_classes, kernel_size=1)
 
     def forward(self, x):
+        insz = x.shape[-2:]
         features = []
         for i, m in enumerate(self.backbone):
             x = m(x)
@@ -69,11 +77,23 @@ class StandardUNet(nn.Module):
                 features.append(x)
                 
         # features[4] = 1/32, features[3] = 1/16, etc.
-        x = self.up1(features[4], features[3])
-        x = self.up2(x, features[2])
-        x = self.up3(x, features[1])
-        x = self.up4(x, features[0])
-        x = self.up5(x)
+        side_feat = features[4]
         
-        logits = self.outc(x)
-        return {'main_output': logits}
+        x_up1 = self.up1(features[4], features[3])      # 512 channels, 1/16 scale
+        x_up2 = self.up2(x_up1, features[2])            # 256 channels, 1/8 scale
+        x_up3 = self.up3(x_up2, features[1])            # 128 channels, 1/4 scale
+        x_up4 = self.up4(x_up3, features[0])            # 64 channels, 1/2 scale
+        x_up5 = self.up5(x_up4)                         # 32 channels, 1/1 scale
+        
+        logits = self.outc(x_up5)
+        
+        return {
+            'main_output': logits,
+            'features': x_up5,
+            'side_output': F.interpolate(self.side_head(side_feat), size=insz, mode='bilinear', align_corners=False),
+            'high_output': F.interpolate(self.high_head(x_up1), size=insz, mode='bilinear', align_corners=False),
+            'mid_high_output': F.interpolate(self.mid_high_head(x_up2), size=insz, mode='bilinear', align_corners=False),
+            'mid_output': F.interpolate(self.mid_head(x_up3), size=insz, mode='bilinear', align_corners=False),
+            'low_output': F.interpolate(self.low_head(x_up4), size=insz, mode='bilinear', align_corners=False)
+        }
+
