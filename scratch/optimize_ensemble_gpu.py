@@ -81,15 +81,40 @@ def main():
             img_norm = (img_resized.astype(np.float32) / 255.0 - mean) / std
             x = torch.tensor(img_norm.transpose(2, 0, 1)[None, ...], dtype=torch.float32).to(device)
             
-            # Predict Synergistic Net
-            out_syn = model_syn(x)
-            p_syn_main = F.softmax(out_syn['main_output'], dim=1)
-            p_syn_unet = F.softmax(out_syn['unet_output'], dim=1)
-            p_syn_dl = F.softmax(out_syn['deeplab_output'], dim=1)
+            # Predict Synergistic Net (Standard Pass)
+            out_syn_std = model_syn(x)
+            p_syn_main_std = F.softmax(out_syn_std['main_output'], dim=1)
+            p_syn_unet_std = F.softmax(out_syn_std['unet_output'], dim=1)
+            p_syn_dl_std = F.softmax(out_syn_std['deeplab_output'], dim=1)
+            del out_syn_std
+            
+            # Predict Synergistic Net (Flip Pass)
+            x_flipped = torch.flip(x.cpu(), dims=[3]).to(device)
+            out_syn_flip = model_syn(x_flipped)
+            
+            p_syn_main_flip = F.softmax(out_syn_flip['main_output'], dim=1)
+            p_syn_main_unflip = torch.flip(p_syn_main_flip.cpu(), dims=[3]).to(device)
+            del p_syn_main_flip
+            
+            p_syn_unet_flip = F.softmax(out_syn_flip['unet_output'], dim=1)
+            p_syn_unet_unflip = torch.flip(p_syn_unet_flip.cpu(), dims=[3]).to(device)
+            del p_syn_unet_flip
+            
+            p_syn_dl_flip = F.softmax(out_syn_flip['deeplab_output'], dim=1)
+            p_syn_dl_unflip = torch.flip(p_syn_dl_flip.cpu(), dims=[3]).to(device)
+            del p_syn_dl_flip, out_syn_flip, x_flipped
+            
+            # Average predictions for TTA
+            p_syn_main = (p_syn_main_std + p_syn_main_unflip) / 2.0
+            p_syn_unet = (p_syn_unet_std + p_syn_unet_unflip) / 2.0
+            p_syn_dl = (p_syn_dl_std + p_syn_dl_unflip) / 2.0
+            del p_syn_main_std, p_syn_main_unflip, p_syn_unet_std, p_syn_unet_unflip, p_syn_dl_std, p_syn_dl_unflip
+            
             p_syn = 0.4 * p_syn_main + 0.3 * p_syn_unet + 0.3 * p_syn_dl
             p_syn[:, 0] = p_syn_main[:, 0] # Keep background class unscaled
+            del p_syn_main, p_syn_unet, p_syn_dl
             
-            # Predict Meta Net
+            # Predict Meta Net (contains built-in TTA)
             meta_logits = model_meta(x)
             p_meta_pred = F.softmax(meta_logits, dim=1)
             
@@ -98,7 +123,8 @@ def main():
             P_meta[idx] = p_meta_pred.squeeze(0).to(torch.float16)
             
             # Free temporary GPU variables
-            del x, out_syn, p_syn_main, p_syn_unet, p_syn_dl, p_syn, meta_logits, p_meta_pred
+            del x, p_syn, p_meta_pred
+            
             
     # Delete models to free VRAM
     del model_syn, model_meta

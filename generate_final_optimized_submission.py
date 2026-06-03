@@ -13,6 +13,7 @@ import csv
 from synergistic_model import FloodNetSynergisticNet
 from competitive_model import FloodNetCompetitiveModel
 from optimized_pytorch_version import DatasetConfig
+from scratch.eval_advanced_tta import neighbor_fill_cleanup
 
 def mask2rle(img: np.ndarray) -> str:
     pixels = img.T.ravel()
@@ -41,7 +42,7 @@ def apply_multiclass_thresholding(probs: np.ndarray, thresh_arr: np.ndarray) -> 
     return pred
 
 def main():
-    print("Initializing Final Optimized Ensemble Inference Pipeline...")
+    print("Initializing Final Optimized Ensemble Inference Pipeline (TTA Enabled)...")
     os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
     
     TEST_IMG_DIR = "/home/fred/Downloads/opencv-tf-project-3-image-segmentation-round-2/Project_3_FloodNet_Dataset/test/images"
@@ -75,9 +76,25 @@ def main():
     # Disable cudnn benchmark for stability on ROCm/AMD
     torch.backends.cudnn.benchmark = False
     
-    # Optimal weights and thresholds from full validation sweep
-    best_w = np.array([0.5000, 0.6044, 0.5545, 0.7465, 0.5414, 1.0000, 1.0000, 0.7176, 1.0000, 0.5000], dtype=np.float32)
-    best_t = np.array([0.9803, 0.5107, 0.0000, 0.6320, 0.0000, 0.0000, 0.0000, 0.0000, 0.3774, 0.0000], dtype=np.float32)
+    # Load optimized parameters dynamically from config
+    config_path = "model_checkpoint/ensemble_optimized_config.pt"
+    if os.path.exists(config_path):
+        print(f"Loading optimized config from {config_path}...")
+        config = torch.load(config_path, map_location='cpu')
+        best_w = np.array(config['best_w'], dtype=np.float32)
+        best_t = np.array(config['best_t'], dtype=np.float32)
+        best_area = config.get('best_area', 16)
+        print("Loaded configurations successfully!")
+    else:
+        print("WARNING: Optimized config not found, using default fallback values.")
+        best_w = np.array([0.5000, 0.5546, 0.4577, 1.0000, 0.4493, 1.0000, 0.6505, 1.0000, 1.0000, 0.3827], dtype=np.float32)
+        best_t = np.array([0.0000, 0.4999, 0.0000, 0.6484, 0.0000, 0.0000, 0.0000, 0.0000, 0.3531, 0.0000], dtype=np.float32)
+        best_area = 16
+        
+    print("Optimization Parameters:")
+    print(f"  w_syn: {best_w.tolist()}")
+    print(f"  thresh: {best_t.tolist()}")
+    print(f"  min_area: {best_area}")
     
     if "DRY_RUN" in os.environ:
         print("[DRY RUN] Limiting inference to first 10 images.")
@@ -111,18 +128,43 @@ def main():
                 
                 x = torch.tensor(img_tensor[None, ...], dtype=torch.float32).to(device)
                 
-                # Predict Synergistic Net
-                out_syn = syn_model(x)
-                p_syn_main = F.softmax(out_syn['main_output'], dim=1).cpu().numpy()[0]
-                p_syn_unet = F.softmax(out_syn['unet_output'], dim=1).cpu().numpy()[0]
-                p_syn_dl = F.softmax(out_syn['deeplab_output'], dim=1).cpu().numpy()[0]
+                # Predict Synergistic Net (Standard Pass)
+                out_syn_std = syn_model(x)
+                p_syn_main_std = F.softmax(out_syn_std['main_output'], dim=1)
+                p_syn_unet_std = F.softmax(out_syn_std['unet_output'], dim=1)
+                p_syn_dl_std = F.softmax(out_syn_std['deeplab_output'], dim=1)
+                del out_syn_std
+                
+                # Predict Synergistic Net (Flip Pass)
+                x_flipped = torch.flip(x.cpu(), dims=[3]).to(device)
+                out_syn_flip = syn_model(x_flipped)
+                
+                p_syn_main_flip = F.softmax(out_syn_flip['main_output'], dim=1)
+                p_syn_main_unflip = torch.flip(p_syn_main_flip.cpu(), dims=[3]).to(device)
+                del p_syn_main_flip
+                
+                p_syn_unet_flip = F.softmax(out_syn_flip['unet_output'], dim=1)
+                p_syn_unet_unflip = torch.flip(p_syn_unet_flip.cpu(), dims=[3]).to(device)
+                del p_syn_unet_flip
+                
+                p_syn_dl_flip = F.softmax(out_syn_flip['deeplab_output'], dim=1)
+                p_syn_dl_unflip = torch.flip(p_syn_dl_flip.cpu(), dims=[3]).to(device)
+                del p_syn_dl_flip, out_syn_flip, x_flipped
+                
+                # Average predictions for TTA
+                p_syn_main = ((p_syn_main_std + p_syn_main_unflip) / 2.0).squeeze(0).cpu().numpy()
+                p_syn_unet = ((p_syn_unet_std + p_syn_unet_unflip) / 2.0).squeeze(0).cpu().numpy()
+                p_syn_dl = ((p_syn_dl_std + p_syn_dl_unflip) / 2.0).squeeze(0).cpu().numpy()
+                del p_syn_main_std, p_syn_main_unflip, p_syn_unet_std, p_syn_unet_unflip, p_syn_dl_std, p_syn_dl_unflip
                 
                 p_syn = 0.4 * p_syn_main + 0.3 * p_syn_unet + 0.3 * p_syn_dl
                 p_syn[0] = p_syn_main[0] # keep class 0 unscaled
+                del p_syn_main, p_syn_unet, p_syn_dl
                 
-                # Predict Meta Net
+                # Predict Meta Net (contains built-in TTA)
                 meta_logits = meta_model(x)
-                p_meta = F.softmax(meta_logits, dim=1).cpu().numpy()[0]
+                p_meta = F.softmax(meta_logits, dim=1).squeeze(0).cpu().numpy()
+                del meta_logits
                 
                 # Blend using class-specific weights
                 w_syn_reshaped = best_w.reshape(10, 1, 1)
@@ -131,6 +173,10 @@ def main():
                 
                 # Apply multiclass thresholds
                 pred_mask = apply_multiclass_thresholding(p_blend, best_t)
+                
+                # Apply morphological cleanup
+                if best_area > 0:
+                    pred_mask = neighbor_fill_cleanup(pred_mask.astype(np.uint8), min_area=best_area)
                 
                 # Resize final mask back to high resolution
                 pred_hr = cv2.resize(pred_mask.astype(np.uint8), (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
@@ -144,11 +190,11 @@ def main():
                         rle_str = mask2rle((pred_hr == class_id).astype(np.uint8))
                         writer.writerow([row_id, rle_str])
                         
-                del x, out_syn, meta_logits, p_syn, p_meta, p_blend, pred_mask, pred_hr
+                del x, p_syn, p_meta, p_blend, pred_mask, pred_hr
                 gc.collect()
                 torch.cuda.empty_cache()
                 
-    print(f"\nSUCCESS! Generated optimal submission file: {out_file}")
+    print(f"\nSUCCESS! Generated optimal TTA-enabled submission file: {out_file}")
 
 if __name__ == '__main__':
     main()
