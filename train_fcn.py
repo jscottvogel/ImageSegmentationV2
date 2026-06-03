@@ -11,7 +11,7 @@ from fcn_version import ResNet50FCN
 def train_fcn():
     run_standard_training(
         model_name="FCN",
-        model_fn=ResNet50FCN,
+        model_fn=lambda num_classes: ResNet50FCN(num_classes=num_classes, use_se=True),
         get_backbone_fn=lambda m: m.model.backbone,
         log_file_name="fcn_trace.log",
         checkpoint_dir="model_checkpoint/FloodNet_FCN"

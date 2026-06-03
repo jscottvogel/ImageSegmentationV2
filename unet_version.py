@@ -3,9 +3,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return x * self.fc(x)
+
 class DoubleConv(nn.Module):
-    """(Conv2d => BatchNorm => ReLU) * 2"""
-    def __init__(self, in_channels, out_channels):
+    """(Conv2d => BatchNorm => ReLU) * 2 with optional SEBlock"""
+    def __init__(self, in_channels, out_channels, use_se=False):
         super().__init__()
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
@@ -15,15 +29,16 @@ class DoubleConv(nn.Module):
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
+        self.se = SEBlock(out_channels) if use_se else nn.Identity()
 
     def forward(self, x):
-        return self.double_conv(x)
+        return self.se(self.double_conv(x))
 
 class Up(nn.Module):
-    def __init__(self, in_channels_x1, in_channels_x2, out_channels):
+    def __init__(self, in_channels_x1, in_channels_x2, out_channels, use_se=False):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv = DoubleConv(in_channels_x1 + in_channels_x2, out_channels)
+        self.conv = DoubleConv(in_channels_x1 + in_channels_x2, out_channels, use_se=use_se)
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
@@ -36,10 +51,12 @@ class Up(nn.Module):
 class StandardUNet(nn.Module):
     """
     Enterprise UNet Implementation targeting Image Segmentation with EfficientNetV2 Backbone.
+    Supports optional SE attention blocks in the decoder.
     """
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=10, use_se=True):
         super().__init__()
         self.num_classes = num_classes
+        self.use_se = use_se
 
         # Pre-trained ImageNet Encoder for high DICE
         self.backbone = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.IMAGENET1K_V1).features
@@ -50,14 +67,14 @@ class StandardUNet(nn.Module):
         # Layer 5: 160 channels (1/16 scale)
         # Layer 7: 1280 channels (1/32 scale)
 
-        self.up1 = Up(1280, 160, 512)
-        self.up2 = Up(512, 64, 256)
-        self.up3 = Up(256, 48, 128)
-        self.up4 = Up(128, 24, 64)
+        self.up1 = Up(1280, 160, 512, use_se=use_se)
+        self.up2 = Up(512, 64, 256, use_se=use_se)
+        self.up3 = Up(256, 48, 128, use_se=use_se)
+        self.up4 = Up(128, 24, 64, use_se=use_se)
         
         self.up5 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            DoubleConv(64, 32)
+            DoubleConv(64, 32, use_se=use_se)
         )
         self.outc = nn.Conv2d(32, num_classes, kernel_size=1)
         

@@ -77,7 +77,18 @@ def main():
         'Synergistic Optimized T90': 'synergistic_optimized_t90_submission.csv',
         'Synergistic Optimized T95': 'synergistic_optimized_t95_submission.csv',
         'Synergistic Optimized T99': 'synergistic_optimized_t99_submission.csv',
-        'Blended Ensemble Submission': 'blended_ensemble_submission.csv'
+        'Blended Ensemble Submission': 'blended_ensemble_submission.csv',
+        'Synergistic Pure TTA T95 Area 25': 'synergistic_pure_tta_t95_area25_submission.csv',
+        'Synergistic Pure TTA T90 Area 8': 'synergistic_pure_tta_t90_area8_submission.csv',
+        'Hybrid Pure TTA T95 Area 25': 'hybrid_pure_tta_t95_area25_submission.csv',
+        'Synergistic TTA Suppress C0 C3': 'synergistic_tta_suppress_c0_c3_submission.csv',
+        'Hybrid TTA Suppress C0 C3': 'hybrid_tta_suppress_c0_c3_submission.csv',
+        'Hybrid TTA Suppress C0 C3 C1': 'hybrid_tta_suppress_c0_c3_c1_submission.csv',
+        'Ensemble w50 t95 C3 C1 Area64 (No-TTA)': 'ensemble_w50_t95_c3t50_c1t50_area64_submission.csv',
+        'Ensemble w50 t100 C3 C1 Area64 (No-TTA)': 'ensemble_w50_t100_c3t50_c1t50_area64_submission.csv',
+        'Ensemble w50 t100 C3 C1 Area128 (No-TTA)': 'ensemble_w50_t100_c3t50_c1t50_area128_submission.csv',
+        'Ensemble w50 t90 C3 C1 Area128 (No-TTA)': 'ensemble_w50_t90_c3t50_c1t50_area128_submission.csv',
+        'Ensemble w50 t95 C3 C1 Area128 (No-TTA)': 'ensemble_w50_t95_c3t50_c1t50_area128_submission.csv'
     }
     
     for name, path in paths.items():

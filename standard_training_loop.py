@@ -31,6 +31,11 @@ def run_standard_training(model_name, model_fn, get_backbone_fn, log_file_name, 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Initializing Standard PyTorch {model_name} on {device}")
     
+    dry_run = os.environ.get("LIMIT_BATCHES", "0") != "0" or os.environ.get("DRY_RUN", "0") == "1"
+    if dry_run:
+        TrainingConfig.EPOCHS = 1
+        TrainingConfig.LOG_INTERVAL = 1
+        
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     model = model_fn(num_classes=DatasetConfig.NUM_CLASSES).to(device)
@@ -41,7 +46,7 @@ def run_standard_training(model_name, model_fn, get_backbone_fn, log_file_name, 
         logger.info(f"Found existing checkpoint. Resuming {model_name} from: {best_ckpt}")
         try:
             state_dict = torch.load(best_ckpt, map_location=device, weights_only=True)
-            model.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state_dict.items()})
+            model.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state_dict.items()}, strict=False)
         except Exception as e:
             logger.warning(f"Failed to load checkpoint: {e}")
             
@@ -102,8 +107,11 @@ def run_standard_training(model_name, model_fn, get_backbone_fn, log_file_name, 
             epoch_loss = 0.0
             
             optimizer.zero_grad(set_to_none=True)
-            
+            limit_batches = int(os.environ.get("LIMIT_BATCHES", "0"))
             for b_idx, (images, targets) in enumerate(loader):
+                if limit_batches > 0 and b_idx >= limit_batches:
+                    logger.info(f"Reached LIMIT_BATCHES ({limit_batches}). Stopping epoch early.")
+                    break
                 try:
                     images = images.to(device, non_blocking=True)
                     labels = targets['main_output'].to(device, non_blocking=True)
@@ -190,14 +198,19 @@ def run_standard_training(model_name, model_fn, get_backbone_fn, log_file_name, 
         torch.save(model.state_dict(), f"{checkpoint_dir}/interrupted_weights.pt")
         
     finally:
-        logger.info("Executing final SWA BatchNorm Update for maximal test-set generalization on Pristine Data...")
-        
-        clean_swa_loader = DataLoader(
-            FloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color, apply_aug=False), 
-            batch_size=TrainingConfig.BATCH_SIZE, shuffle=False, drop_last=False, num_workers=2, pin_memory=True
-        )
-        
-        torch.optim.swa_utils.update_bn(clean_swa_loader, swa_model, device=device)
-        torch.save(swa_model.state_dict(), f"{checkpoint_dir}/final_swa_smoothed_{model_name.lower()}.pt")
-        writer.close()
-        logger.info(f"SWA {model_name} Weights successfully flushed to disk!")
+        dry_run = os.environ.get("LIMIT_BATCHES", "0") != "0" or os.environ.get("DRY_RUN", "0") == "1"
+        if dry_run:
+            logger.info("Skipping SWA BatchNorm updates during dry-run.")
+            writer.close()
+        else:
+            logger.info("Executing final SWA BatchNorm Update for maximal test-set generalization on Pristine Data...")
+            
+            clean_swa_loader = DataLoader(
+                FloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color, apply_aug=False), 
+                batch_size=TrainingConfig.BATCH_SIZE, shuffle=False, drop_last=False, num_workers=2, pin_memory=True
+            )
+            
+            torch.optim.swa_utils.update_bn(clean_swa_loader, swa_model, device=device)
+            torch.save(swa_model.state_dict(), f"{checkpoint_dir}/final_swa_smoothed_{model_name.lower()}.pt")
+            writer.close()
+            logger.info(f"SWA {model_name} Weights successfully flushed to disk!")

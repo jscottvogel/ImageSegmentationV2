@@ -194,11 +194,32 @@ class FloodNetPyTorchDataset(Dataset):
         return img, {'main_output': torch.tensor(label, dtype=torch.long), 'edge_output': edge}
 
 # === ARCHITECTURE ===
-def conv_bn_relu(in_channels: int, out_channels: int) -> nn.Sequential:
-    return nn.Sequential(nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False), nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True))
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return x * self.fc(x)
+
+def conv_bn_relu(in_channels: int, out_channels: int, use_se: bool=False) -> nn.Sequential:
+    layers = [
+        nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU(inplace=True)
+    ]
+    if use_se:
+        layers.append(SEBlock(out_channels))
+    return nn.Sequential(*layers)
 
 class ASPP(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int=256):
+    def __init__(self, in_channels: int, out_channels: int=256, use_se: bool=False):
         super().__init__()
         # ASPP handles Multi-Scale fields without reshaping
         # Adjusted ASPP Dilations to [3, 6, 9] to safely match the OS=32 (16x16) PyTorch EfficientNet extraction
@@ -207,31 +228,40 @@ class ASPP(nn.Module):
         self.c3 = nn.Sequential(nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False), nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True))
         self.c4 = nn.Sequential(nn.Conv2d(in_channels, out_channels, 3, padding=9, dilation=9, bias=False), nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True))
         self.pool = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)), nn.Conv2d(in_channels, out_channels, 1, bias=False), nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True))
-        self.proj = nn.Sequential(nn.Conv2d(5 * out_channels, out_channels, 1, bias=False), nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True))
+        
+        proj_layers = [
+            nn.Conv2d(5 * out_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        ]
+        if use_se:
+            proj_layers.append(SEBlock(out_channels))
+        self.proj = nn.Sequential(*proj_layers)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         size = x.shape[-2:]
         return self.proj(torch.cat([F.interpolate(self.pool(x), size=size, mode='bilinear', align_corners=False), self.c1(x), self.c2(x), self.c3(x), self.c4(x)], 1))
 
 class CustomDeepLabV3Plus(nn.Module):
-    def __init__(self, num_classes: int=10):
+    def __init__(self, num_classes: int=10, use_se: bool=True):
         super().__init__()
         import torchvision.models as models
+        self.use_se = use_se
         
         # 1. Grab base EfficientNet structures via Feature extraction framework
         self.backbone = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.IMAGENET1K_V1).features
-        self.aspp = ASPP(1280, 256)
+        self.aspp = ASPP(1280, 256, use_se=use_se)
         
         # 2. Allocate the decoders for progressive refinement across the 5 output maps
         self.high_conv = conv_bn_relu(160, 128)
-        self.fuse_high = conv_bn_relu(256 + 128, 256)
+        self.fuse_high = conv_bn_relu(256 + 128, 256, use_se=use_se)
         self.mid_high_conv = conv_bn_relu(128, 128)
-        self.fuse_mid_high = conv_bn_relu(256 + 128, 256)
+        self.fuse_mid_high = conv_bn_relu(256 + 128, 256, use_se=use_se)
         self.mid_conv = conv_bn_relu(64, 64)
-        self.fuse_mid = conv_bn_relu(256 + 64, 128)
+        self.fuse_mid = conv_bn_relu(256 + 64, 128, use_se=use_se)
         self.low_conv = conv_bn_relu(48, 48)
-        self.fuse_low = conv_bn_relu(128 + 48, 64)
-        self.final_refine = conv_bn_relu(64, 64)
+        self.fuse_low = conv_bn_relu(128 + 48, 64, use_se=use_se)
+        self.final_refine = conv_bn_relu(64, 64, use_se=use_se)
         
         # 3. Create prediction output blocks
         self.main_head = nn.Conv2d(64, num_classes, 1)
@@ -461,8 +491,12 @@ def multiscale_inference(model: nn.Module, image_tensor: torch.Tensor) -> torch.
 def train_loop():
     logger.info("Initializing Distributed Pipeline Router...")
     os.makedirs(TrainingConfig.CHECKPOINT_DIR, exist_ok=True)
+    dry_run = os.environ.get("LIMIT_BATCHES", "0") != "0" or os.environ.get("DRY_RUN", "0") == "1"
+    if dry_run:
+        TrainingConfig.EPOCHS = 1
+        TrainingConfig.LOG_INTERVAL = 1
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = CustomDeepLabV3Plus(num_classes=DatasetConfig.NUM_CLASSES).to(device)
+    model = CustomDeepLabV3Plus(num_classes=DatasetConfig.NUM_CLASSES, use_se=True).to(device)
     
     # Auto-Resume Logic
     best_ckpt = os.path.join(TrainingConfig.CHECKPOINT_DIR, "best_deeplab_weights.pt")
@@ -470,7 +504,7 @@ def train_loop():
         logger.info(f"Found existing checkpoint. Resuming DeepLab from: {best_ckpt}")
         try:
             state_dict = torch.load(best_ckpt, map_location=device, weights_only=True)
-            model.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state_dict.items()})
+            model.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state_dict.items()}, strict=False)
         except Exception as e:
             logger.warning(f"Failed to load checkpoint: {e}")
             
@@ -550,7 +584,11 @@ def train_loop():
             t_hard_u = torch.zeros(DatasetConfig.NUM_CLASSES, device=device)
             
             optimizer.zero_grad(set_to_none=True)
+            limit_batches = int(os.environ.get("LIMIT_BATCHES", "0"))
             for b_idx, (im, tgts) in enumerate(loader):
+                if limit_batches > 0 and b_idx >= limit_batches:
+                    logger.info(f"Reached LIMIT_BATCHES ({limit_batches}). Stopping epoch early.")
+                    break
                 # Enable Gradient Accumulation for massive backbones
                 is_accum_step = ((b_idx + 1) % TrainingConfig.GRAD_ACCUMULATION_STEPS == 0) or ((b_idx + 1) == len(loader))
                 
@@ -648,19 +686,24 @@ def train_loop():
         torch.save(model.state_dict(), os.path.join(TrainingConfig.CHECKPOINT_DIR, "interrupted_weights.pt"))
         
     finally:
-        logger.info("Executing SWA Validation Updates on Pristine Data...")
-        
-        # SWA BUG FIX: Create an un-augmented loader so BatchNorm layers don't memorize geometric noise!
-        clean_swa_loader = DataLoader(
-            FloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color, apply_aug=False), 
-            batch_size=TrainingConfig.BATCH_SIZE, shuffle=False, drop_last=False,
-            num_workers=2, pin_memory=True
-        )
-        
-        torch.optim.swa_utils.update_bn(clean_swa_loader, swa_model, device=device)
-        torch.save(swa_model.state_dict(), os.path.join(TrainingConfig.CHECKPOINT_DIR, "final_swa_smoothed_weights.pt"))
-        writer.close()
-        logger.info("SWA parameters flushed to disk. Terminating.")
+        dry_run = os.environ.get("LIMIT_BATCHES", "0") != "0" or os.environ.get("DRY_RUN", "0") == "1"
+        if dry_run:
+            logger.info("Skipping SWA BatchNorm updates during dry-run.")
+            writer.close()
+        else:
+            logger.info("Executing SWA Validation Updates on Pristine Data...")
+            
+            # SWA BUG FIX: Create an un-augmented loader so BatchNorm layers don't memorize geometric noise!
+            clean_swa_loader = DataLoader(
+                FloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color, apply_aug=False), 
+                batch_size=TrainingConfig.BATCH_SIZE, shuffle=False, drop_last=False,
+                num_workers=2, pin_memory=True
+            )
+            
+            torch.optim.swa_utils.update_bn(clean_swa_loader, swa_model, device=device)
+            torch.save(swa_model.state_dict(), os.path.join(TrainingConfig.CHECKPOINT_DIR, "final_swa_smoothed_weights.pt"))
+            writer.close()
+            logger.info("SWA parameters flushed to disk. Terminating.")
 
 if __name__ == '__main__':
     train_loop()

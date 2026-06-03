@@ -19,7 +19,7 @@ model_dl = CustomDeepLabV3Plus(num_classes=10).to(device)
 dl_weights = "model_checkpoint/FloodNet_PyTorch/best_deeplab_weights.pt"
 if os.path.exists(dl_weights):
     state = torch.load(dl_weights, map_location=device, weights_only=True)
-    model_dl.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state.items()})
+    model_dl.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state.items()}, strict=False)
 model_dl.eval()
 
 # 2. UNet
@@ -27,7 +27,7 @@ model_unet = StandardUNet(num_classes=10).to(device)
 unet_weights = "model_checkpoint/FloodNet_UNet/best_unet_weights.pt"
 if os.path.exists(unet_weights):
     state = torch.load(unet_weights, map_location=device, weights_only=True)
-    model_unet.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state.items()})
+    model_unet.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state.items()}, strict=False)
 model_unet.eval()
 
 # 3. FCN
@@ -35,7 +35,7 @@ model_fcn = ResNet50FCN(num_classes=10).to(device)
 fcn_weights = "model_checkpoint/FloodNet_FCN/best_fcn_weights.pt"
 if os.path.exists(fcn_weights):
     state = torch.load(fcn_weights, map_location=device, weights_only=True)
-    model_fcn.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state.items()})
+    model_fcn.load_state_dict({k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state.items()}, strict=False)
 model_fcn.eval()
 
 print("Models loaded.")

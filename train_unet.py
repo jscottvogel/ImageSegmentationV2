@@ -8,7 +8,7 @@ from unet_version import StandardUNet
 def train_unet():
     run_standard_training(
         model_name="UNet",
-        model_fn=StandardUNet,
+        model_fn=lambda num_classes: StandardUNet(num_classes=num_classes, use_se=True),
         get_backbone_fn=lambda m: m.backbone,
         log_file_name="unet_trace.log",
         checkpoint_dir="model_checkpoint/FloodNet_UNet"

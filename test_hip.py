@@ -1,3 +1,5 @@
+import os
+os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
 import torch
 from optimized_pytorch_version import CustomDeepLabV3Plus, DatasetConfig
 device = torch.device('cuda')

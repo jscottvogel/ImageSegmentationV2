@@ -50,10 +50,10 @@ def main():
         image_paths, mask_paths, test_size=0.2, random_state=42
     )
     
-    # Evaluate on 80 validation images for robust statistics
-    val_img_paths = val_img_paths[:80]
-    val_msk_paths = val_msk_paths[:80]
-    print(f"Evaluating on {len(val_img_paths)} validation images.")
+    # Evaluate on 100 validation images for robust statistics
+    val_img_paths = val_img_paths[:100]
+    val_msk_paths = val_msk_paths[:100]
+    print(f"Evaluating on {len(val_img_paths)} validation images at 480x480 resolution.")
     
     model = FloodNetSynergisticNet(num_classes=10).to(device)
     weights_path = "model_checkpoint/FloodNet_Synergistic/best_synergistic_weights.pt"
@@ -72,11 +72,13 @@ def main():
     with torch.no_grad():
         for idx in tqdm(range(len(val_img_paths)), desc="Precomputing validation probabilities"):
             img_bgr = cv2.imread(val_img_paths[idx])
-            orig_h, orig_w = img_bgr.shape[:2]
             
             msk = cv2.imread(val_msk_paths[idx])
             msk_rgb = cv2.cvtColor(msk, cv2.COLOR_BGR2RGB)
-            label = rgb_to_mask(msk_rgb, id2color, 10)
+            
+            # Resize target mask to 480x480 for fast validation
+            msk_resized = cv2.resize(msk_rgb, (DatasetConfig.IMG_WIDTH, DatasetConfig.IMG_HEIGHT), interpolation=cv2.INTER_NEAREST)
+            label = rgb_to_mask(msk_resized, id2color, 10)
             targets.append(label)
             
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -109,15 +111,19 @@ def main():
             p_dl_unflip = torch.flip(p_dl_flip, dims=[3]).squeeze(0).cpu().numpy()
             p_dl_tta = 0.5 * (p_dl + p_dl_unflip)
             
-            # Store resized probs
-            p_dict_notta = {'main': p_main, 'unet': p_unet, 'deeplab': p_dl, 'orig_size': (orig_w, orig_h)}
-            p_dict_tta = {'main': p_main_tta, 'unet': p_unet_tta, 'deeplab': p_dl_tta, 'orig_size': (orig_w, orig_h)}
+            # Store probs
+            p_dict_notta = {'main': p_main, 'unet': p_unet, 'deeplab': p_dl}
+            p_dict_tta = {'main': p_main_tta, 'unet': p_unet_tta, 'deeplab': p_dl_tta}
             
             probs_notta.append(p_dict_notta)
             probs_tta.append(p_dict_tta)
             
+    # Free GPU memory
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     # Sweep space
-    # Blends: (w_main, w_unet, w_dl)
     blends = [
         (1.0, 0.0, 0.0),
         (0.8, 0.1, 0.1),
@@ -129,11 +135,10 @@ def main():
     ]
     
     thresholds = [0.0, 0.9, 0.95, 0.98, 0.99, 0.995]
-    min_areas = [0, 50, 100, 120, 150]
+    # min_areas at 480x480 (scaled down by ~39 from original sizes)
+    # Area 3-5 at 480x480 corresponds to ~120-200 at 3000x2000
+    min_areas = [0, 1, 2, 3, 4, 5, 8]
     modes = ['No-TTA', 'TTA']
-    
-    best_dice = 0.0
-    best_config = None
     
     results = []
     
@@ -142,38 +147,31 @@ def main():
         for w_main, w_unet, w_dl in blends:
             for thresh in thresholds:
                 for area in min_areas:
-                    # Evaluate on all 80 images
+                    # Evaluate on all 100 images
                     dice_vals = []
                     for idx in range(len(val_img_paths)):
                         p_dict = probs_source[idx]
-                        orig_w, orig_h = p_dict['orig_size']
                         target = targets[idx]
                         
-                        # Blend at 480x480 first (faster and more correct)
+                        # Blend at 480x480
                         p_blend = w_main * p_dict['main'] + w_unet * p_dict['unet'] + w_dl * p_dict['deeplab']
                         p_blend[0] = p_dict['main'][0] # Keep main class 0 unscaled
                         
-                        # Resize blended probability map to original size
-                        p_resized = np.zeros((10, orig_h, orig_w), dtype=np.float32)
-                        for c in range(10):
-                            p_resized[c] = cv2.resize(p_blend[c], (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-                            
                         # Apply class argmax and thresholding
                         if thresh == 0.0:
-                            pred_labels = np.argmax(p_resized, axis=0)
+                            pred_labels = np.argmax(p_blend, axis=0)
                         else:
-                            pred_labels = np.argmax(p_resized, axis=0)
+                            pred_labels = np.argmax(p_blend, axis=0)
                             c0_mask = (pred_labels == 0)
-                            low_conf = c0_mask & (p_resized[0] < thresh)
+                            low_conf = c0_mask & (p_blend[0] < thresh)
                             if np.any(low_conf):
-                                fallback = np.argmax(p_resized[1:], axis=0) + 1
+                                fallback = np.argmax(p_blend[1:], axis=0) + 1
                                 pred_labels[low_conf] = fallback[low_conf]
                                 
                         if area > 0:
                             pred_labels = neighbor_fill_cleanup(pred_labels.astype(np.uint8), min_area=area)
                             
                         valid_mask = (target != 255)
-                        # Mean Dice over non-background classes (1 to 9)
                         img_dices = []
                         for c in range(1, 10):
                             pred_c = (pred_labels == c) & valid_mask
@@ -191,19 +189,17 @@ def main():
                         'area': area,
                         'dice': mean_val_dice
                     })
-                    
-                    if mean_val_dice > best_dice:
-                        best_dice = mean_val_dice
-                        best_config = results[-1]
                         
     # Sort results
     results = sorted(results, key=lambda x: x['dice'], reverse=True)
     
     print("\n" + "="*70)
-    print("TOP 15 POST-PROCESSING CONFIGURATIONS")
+    print("TOP 15 POST-PROCESSING CONFIGURATIONS (EVALUATED AT 480x480)")
     print("="*70)
     for idx, r in enumerate(results[:15]):
-        print(f"{idx+1:02d}. Mode: {r['mode']:6s} | Blend: ({r['w_main']:.2f}, {r['w_unet']:.2f}, {r['w_dl']:.2f}) | Thresh C0: {r['thresh']:.3f} | Area: {r['area']:3d} || Mean Dice: {r['dice']:.5f}")
+        # Map scaled area back to original area for printing
+        orig_area_estimate = r['area'] * 39
+        print(f"{idx+1:02d}. Mode: {r['mode']:6s} | Blend: ({r['w_main']:.2f}, {r['w_unet']:.2f}, {r['w_dl']:.2f}) | Thresh C0: {r['thresh']:.3f} | Area (orig equivalent): {orig_area_estimate:3d} || Mean Dice: {r['dice']:.5f}")
     print("="*70)
 
 if __name__ == '__main__':

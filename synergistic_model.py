@@ -6,6 +6,25 @@ from unet_version import StandardUNet
 from optimized_pytorch_version import CustomDeepLabV3Plus
 from fcn_version import ResNet50FCN
 
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+           
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
 class FloodNetSynergisticNet(nn.Module):
     """
     Synergistic Feature-Level Fusion Segmentation Network for FloodNet.
@@ -16,14 +35,15 @@ class FloodNetSynergisticNet(nn.Module):
     Features are projected and interpolated to 1/1 scale, concatenated, 
     and then fused via a deep multi-layer CNN head.
     """
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=10, use_se=True):
         super().__init__()
         self.num_classes = num_classes
+        self.use_se = use_se
         
         # 1. Instantiate the three high-performance base models
-        self.unet = StandardUNet(num_classes=num_classes)
-        self.deeplab = CustomDeepLabV3Plus(num_classes=num_classes)
-        self.fcn = ResNet50FCN(num_classes=num_classes)
+        self.unet = StandardUNet(num_classes=num_classes, use_se=use_se)
+        self.deeplab = CustomDeepLabV3Plus(num_classes=num_classes, use_se=use_se)
+        self.fcn = ResNet50FCN(num_classes=num_classes, use_se=use_se)
         
         # 2. Projection layer for FCN features (512 channels -> 64 channels)
         self.fcn_proj = nn.Sequential(
@@ -32,7 +52,10 @@ class FloodNetSynergisticNet(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # 3. Fusion Head
+        # 3. Channel Attention module
+        self.channel_attention = ChannelAttention(160, ratio=16)
+        
+        # 4. Fusion Head
         # Inputs: UNet (32 ch) + DeepLab upsampled (64 ch) + FCN projected/upsampled (64 ch) = 160 channels
         self.fusion_conv = nn.Sequential(
             nn.Conv2d(160, 128, kernel_size=3, padding=1, bias=False),
@@ -65,6 +88,10 @@ class FloodNetSynergisticNet(nn.Module):
         
         # 4. Concatenate feature maps
         stacked_features = torch.cat([f_unet, f_dl_up, f_fcn_up], dim=1) # Shape (B, 160, H, W)
+        
+        # Apply Channel Attention to dynamically weight spatial features
+        attention_weights = self.channel_attention(stacked_features)
+        stacked_features = stacked_features * attention_weights
         
         # 5. Pass through fusion head
         fused_main = self.fusion_conv(stacked_features)

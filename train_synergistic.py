@@ -280,7 +280,13 @@ def train_synergistic():
     logger.info("FloodNetSynergisticNet Modular Fusion Training Pipeline Initialized")
     for h in logger.handlers: h.flush()
     
-    TrainingConfig.EPOCHS = 15
+    dry_run = os.environ.get("DRY_RUN", "0") == "1"
+    if dry_run:
+        TrainingConfig.EPOCHS = 1
+        TrainingConfig.LOG_INTERVAL = 1
+        checkpoint_dir = "model_checkpoint/FloodNet_Synergistic_DryRun"
+    else:
+        TrainingConfig.EPOCHS = 15
     TrainingConfig.ROUTER_EPOCH = 0 # Use Phase 2 Lovasz/OHEM hybrid loss from the start
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -290,7 +296,7 @@ def train_synergistic():
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # 1. Instantiate the synergistic model
-    model = FloodNetSynergisticNet(num_classes=DatasetConfig.NUM_CLASSES).to(device)
+    model = FloodNetSynergisticNet(num_classes=DatasetConfig.NUM_CLASSES, use_se=True).to(device)
     
     # 2. Load weights from individual model checkpoints
     initialize_synergistic_weights(model, device, logger)
@@ -307,7 +313,7 @@ def train_synergistic():
         param.requires_grad = False
         
     # 4. Optimizer for fusion and decoders
-    fusion_params = list(model.fusion_conv.parameters()) + list(model.fcn_proj.parameters())
+    fusion_params = list(model.fusion_conv.parameters()) + list(model.fcn_proj.parameters()) + list(model.channel_attention.parameters())
     decoder_params = [p for p in (list(model.unet.parameters()) + list(model.deeplab.parameters()) + list(model.fcn.parameters())) if p.requires_grad]
     
     trainable_params = fusion_params + decoder_params
@@ -349,8 +355,8 @@ def train_synergistic():
     for h in logger.handlers: h.flush()
     dataset = FastFloodNetPyTorchDataset(tr_img, tr_msk, DatasetConfig.NUM_CLASSES, id2color)
     
-    batch_size = 4
-    accum_iter = 2
+    batch_size = int(os.environ.get("BATCH_SIZE", "2"))
+    accum_iter = int(os.environ.get("ACCUM_ITER", "4"))
     
     loader = DataLoader(
         dataset, 
@@ -377,8 +383,11 @@ def train_synergistic():
             epoch_loss = 0.0
             
             optimizer.zero_grad(set_to_none=True)
-            
+            limit_batches = int(os.environ.get("LIMIT_BATCHES", "0"))
             for b_idx, (images, targets) in enumerate(loader):
+                if limit_batches > 0 and b_idx >= limit_batches:
+                    logger.info(f"Reached LIMIT_BATCHES ({limit_batches}). Stopping epoch early.")
+                    break
                 try:
                     images = images.to(device, non_blocking=True)
                     labels = targets['main_output'].to(device, non_blocking=True)

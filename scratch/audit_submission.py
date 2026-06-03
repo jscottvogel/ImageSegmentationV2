@@ -71,9 +71,12 @@ def audit_submission(file_path):
 
 if __name__ == "__main__":
     files = [
-        "synergistic_optimized_t95_submission.csv",
-        "synergistic_optimized_t99_submission.csv",
-        "synergistic_optimized_t995_submission.csv"
+        "ensemble_multiclass_w60_c3t50_area128_submission.csv",
+        "ensemble_multiclass_w55_c3t50_area128_submission.csv",
+        "ensemble_multiclass_w60_c3t50_area64_submission.csv"
     ]
     for f in files:
-        audit_submission(f)
+        if os.path.exists(f):
+            audit_submission(f)
+        else:
+            print(f"Skipping {f} (file does not exist yet)")
