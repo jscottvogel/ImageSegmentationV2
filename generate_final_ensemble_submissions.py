@@ -19,14 +19,14 @@ from scratch.eval_advanced_tta import neighbor_fill_cleanup
 
 def mask2rle(img: np.ndarray) -> str:
     """Highly optimized 1-based RLE encoder."""
-    pixels = img.T.flatten()
+    pixels = img.T.ravel()
     pixels = np.concatenate([[0], pixels, [0]])
     runs = np.where(pixels[1:] != pixels[:-1])[0]
     runs[1::2] -= runs[::2]
     runs[::2] += 1
     if len(runs) == 0:
         return ""
-    return ' '.join(runs.astype(str))
+    return ' '.join(map(str, runs))
 
 def guided_filter(I, p, r, eps):
     """
@@ -162,7 +162,10 @@ def main():
     os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
     TEST_IMG_DIR = "/home/fred/Downloads/opencv-tf-project-3-image-segmentation-round-2/Project_3_FloodNet_Dataset/test/images"
     test_images = sorted(glob.glob(os.path.join(TEST_IMG_DIR, "*.jpg")))
-    
+    if "DRY_RUN" in os.environ:
+        print("[DRY RUN] Limiting inference to first 10 images.")
+        test_images = test_images[:10]
+        
     if len(test_images) == 0:
         print("CRITICAL ERROR: No test images found!")
         return
