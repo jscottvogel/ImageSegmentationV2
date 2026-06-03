@@ -13,10 +13,30 @@ from multiprocessing import Pool
 from torch.utils.data import Dataset, DataLoader
 import csv
 
+from scipy.ndimage import distance_transform_edt
 from synergistic_model import FloodNetSynergisticNet
 from competitive_model import FloodNetCompetitiveModel
 from optimized_pytorch_version import DatasetConfig
 from scratch.eval_advanced_tta import neighbor_fill_cleanup
+
+def neighbor_fill_cleanup_class_specific(pred_labels: np.ndarray, class_areas: list) -> np.ndarray:
+    noise_mask = np.zeros(pred_labels.shape, dtype=bool)
+    for class_id in range(10):
+        area = class_areas[class_id]
+        if area <= 0:
+            continue
+        class_mask = (pred_labels == class_id).astype(np.uint8)
+        num_components, labels, stats, _ = cv2.connectedComponentsWithStats(class_mask, connectivity=8)
+        for i in range(1, num_components):
+            if stats[i, cv2.CC_STAT_AREA] < area:
+                noise_mask[labels == i] = True
+                
+    if not np.any(noise_mask):
+        return pred_labels
+        
+    indices = distance_transform_edt(noise_mask, return_distances=False, return_indices=True)
+    clean_labels = pred_labels[indices[0], indices[1]]
+    return clean_labels
 
 def mask2rle(img: np.ndarray) -> str:
     """Highly optimized 1-based RLE encoder."""
@@ -55,7 +75,7 @@ class TestDataset(Dataset):
         return img_tensor, filename, orig_h, orig_w
 
 def process_single_image(args):
-    filename, orig_h, orig_w, p_syn_notta, p_meta, best_w, best_t, best_area = args
+    filename, orig_h, orig_w, p_syn_notta, p_meta, best_w, best_t, best_areas = args
     
     # 1. Blend
     best_w_arr = np.array(best_w).reshape(10, 1, 1)
@@ -82,8 +102,7 @@ def process_single_image(args):
             pred_labels[mask] = fallback[mask]
             
     # 3. Morphological area cleanup
-    if best_area > 0:
-        pred_labels = neighbor_fill_cleanup(pred_labels.astype(np.uint8), min_area=best_area)
+    pred_labels = neighbor_fill_cleanup_class_specific(pred_labels, best_areas)
         
     # 4. Resize to high-res (nearest)
     pred_hr = cv2.resize(pred_labels, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
@@ -113,10 +132,10 @@ def main():
     config = torch.load(config_path)
     best_w = config['best_w']
     best_t = config['best_t']
-    best_area = config['best_area']
+    best_areas = config.get('best_areas', [config.get('best_area', 96)] * 10)
     
     print("\nLoaded Optimal Hyperparameters:")
-    print(f"  - Morphological min_area: {best_area}")
+    print(f"  - Morphological min_areas: {best_areas}")
     print("  - Weights (w_syn):", [round(w, 4) for w in best_w])
     print("  - Thresholds:", [round(t, 4) for t in best_t])
     
@@ -201,7 +220,7 @@ def main():
                         precomputed_inputs.append((
                             filenames[b], int(orig_hs[b]), int(orig_ws[b]),
                             p_syn_notta[b], p_meta[b],
-                            best_w, best_t, best_area
+                            best_w, best_t, best_areas
                         ))
                         
                     batch_results = pool.map(process_single_image, precomputed_inputs)
