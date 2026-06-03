@@ -49,13 +49,13 @@ class FloodNetCompetitiveModel(nn.Module):
         meta_state = torch.load(meta_path, map_location=device, weights_only=True)
         self.meta_layer.load_state_dict(meta_state)
 
-    def forward(self, x):
+    def forward(self, x, use_tta=False):
         """
         Forward pass.
-        If self.training is True: standard forward pass without TTA.
-        If self.training is False: standard + horizontal flip TTA forward pass.
+        If self.training is True or use_tta is False: standard forward pass without TTA.
+        If self.training is False and use_tta is True: standard + horizontal flip TTA forward pass.
         """
-        if self.training:
+        if self.training or not use_tta:
             # Standard forward pass
             out_unet = self.unet(x)
             if isinstance(out_unet, dict):

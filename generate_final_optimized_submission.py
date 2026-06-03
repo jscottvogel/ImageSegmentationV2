@@ -42,7 +42,7 @@ def apply_multiclass_thresholding(probs: np.ndarray, thresh_arr: np.ndarray) -> 
     return pred
 
 def main():
-    print("Initializing Final Optimized Ensemble Inference Pipeline (TTA Enabled)...")
+    print("Initializing Final Optimized Ensemble Inference Pipeline (No-TTA)...")
     os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
     
     TEST_IMG_DIR = "/home/fred/Downloads/opencv-tf-project-3-image-segmentation-round-2/Project_3_FloodNet_Dataset/test/images"
@@ -83,13 +83,13 @@ def main():
         config = torch.load(config_path, map_location='cpu')
         best_w = np.array(config['best_w'], dtype=np.float32)
         best_t = np.array(config['best_t'], dtype=np.float32)
-        best_area = config.get('best_area', 16)
+        best_area = config.get('best_area', 0)
         print("Loaded configurations successfully!")
     else:
         print("WARNING: Optimized config not found, using default fallback values.")
-        best_w = np.array([0.5000, 0.5546, 0.4577, 1.0000, 0.4493, 1.0000, 0.6505, 1.0000, 1.0000, 0.3827], dtype=np.float32)
-        best_t = np.array([0.0000, 0.4999, 0.0000, 0.6484, 0.0000, 0.0000, 0.0000, 0.0000, 0.3531, 0.0000], dtype=np.float32)
-        best_area = 16
+        best_w = np.array([0.5000, 0.6273, 0.5410, 0.5248, 0.8813, 1.0000, 0.4758, 1.0000, 0.6841, 0.4611], dtype=np.float32)
+        best_t = np.array([0.9794, 0.5347, 0.0000, 0.5355, 0.0000, 0.0000, 0.0000, 0.0000, 0.4006, 0.0000], dtype=np.float32)
+        best_area = 0
         
     print("Optimization Parameters:")
     print(f"  w_syn: {best_w.tolist()}")
@@ -128,42 +128,19 @@ def main():
                 
                 x = torch.tensor(img_tensor[None, ...], dtype=torch.float32).to(device)
                 
-                # Predict Synergistic Net (Standard Pass)
-                out_syn_std = syn_model(x)
-                p_syn_main_std = F.softmax(out_syn_std['main_output'], dim=1)
-                p_syn_unet_std = F.softmax(out_syn_std['unet_output'], dim=1)
-                p_syn_dl_std = F.softmax(out_syn_std['deeplab_output'], dim=1)
-                del out_syn_std
-                
-                # Predict Synergistic Net (Flip Pass)
-                x_flipped = torch.flip(x.cpu(), dims=[3]).to(device)
-                out_syn_flip = syn_model(x_flipped)
-                
-                p_syn_main_flip = F.softmax(out_syn_flip['main_output'], dim=1)
-                p_syn_main_unflip = torch.flip(p_syn_main_flip.cpu(), dims=[3]).to(device)
-                del p_syn_main_flip
-                
-                p_syn_unet_flip = F.softmax(out_syn_flip['unet_output'], dim=1)
-                p_syn_unet_unflip = torch.flip(p_syn_unet_flip.cpu(), dims=[3]).to(device)
-                del p_syn_unet_flip
-                
-                p_syn_dl_flip = F.softmax(out_syn_flip['deeplab_output'], dim=1)
-                p_syn_dl_unflip = torch.flip(p_syn_dl_flip.cpu(), dims=[3]).to(device)
-                del p_syn_dl_flip, out_syn_flip, x_flipped
-                
-                # Average predictions for TTA
-                p_syn_main = ((p_syn_main_std + p_syn_main_unflip) / 2.0).squeeze(0).cpu().numpy()
-                p_syn_unet = ((p_syn_unet_std + p_syn_unet_unflip) / 2.0).squeeze(0).cpu().numpy()
-                p_syn_dl = ((p_syn_dl_std + p_syn_dl_unflip) / 2.0).squeeze(0).cpu().numpy()
-                del p_syn_main_std, p_syn_main_unflip, p_syn_unet_std, p_syn_unet_unflip, p_syn_dl_std, p_syn_dl_unflip
+                # Predict Synergistic Net (Standard Pass only)
+                out_syn = syn_model(x)
+                p_syn_main = F.softmax(out_syn['main_output'], dim=1).cpu().numpy()[0]
+                p_syn_unet = F.softmax(out_syn['unet_output'], dim=1).cpu().numpy()[0]
+                p_syn_dl = F.softmax(out_syn['deeplab_output'], dim=1).cpu().numpy()[0]
                 
                 p_syn = 0.4 * p_syn_main + 0.3 * p_syn_unet + 0.3 * p_syn_dl
                 p_syn[0] = p_syn_main[0] # keep class 0 unscaled
-                del p_syn_main, p_syn_unet, p_syn_dl
+                del p_syn_main, p_syn_unet, p_syn_dl, out_syn
                 
-                # Predict Meta Net (contains built-in TTA)
-                meta_logits = meta_model(x)
-                p_meta = F.softmax(meta_logits, dim=1).squeeze(0).cpu().numpy()
+                # Predict Meta Net (Standard Pass only)
+                meta_logits = meta_model(x, use_tta=False)
+                p_meta = F.softmax(meta_logits, dim=1).cpu().numpy()[0]
                 del meta_logits
                 
                 # Blend using class-specific weights
@@ -194,7 +171,7 @@ def main():
                 gc.collect()
                 torch.cuda.empty_cache()
                 
-    print(f"\nSUCCESS! Generated optimal TTA-enabled submission file: {out_file}")
+    print(f"\nSUCCESS! Generated optimal No-TTA submission file: {out_file}")
 
 if __name__ == '__main__':
     main()
