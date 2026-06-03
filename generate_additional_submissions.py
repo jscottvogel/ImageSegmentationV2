@@ -17,14 +17,14 @@ from optimized_pytorch_version import DatasetConfig
 from scratch.eval_advanced_tta import neighbor_fill_cleanup
 
 def mask2rle(img: np.ndarray) -> str:
-    pixels = img.T.flatten()
+    pixels = img.T.ravel()
     pixels = np.concatenate([[0], pixels, [0]])
     runs = np.where(pixels[1:] != pixels[:-1])[0]
     runs[1::2] -= runs[::2]
     runs[::2] += 1
     if len(runs) == 0:
         return ""
-    return ' '.join(runs.astype(str))
+    return ' '.join(map(str, runs))
 
 class TestDataset(Dataset):
     def __init__(self, image_paths):
@@ -94,47 +94,61 @@ def main():
     )
     meta_model.eval()
     
-    # Enable cudnn benchmark for optimization
-    torch.backends.cudnn.benchmark = True
+    # Disable cudnn benchmark for stability on ROCm/AMD
+    torch.backends.cudnn.benchmark = False
     
-    dataset = TestDataset(test_images)
-    loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=2, pin_memory=False)
+    if "DRY_RUN" in os.environ:
+        print("[DRY RUN] Limiting inference to first 10 images.")
+        test_images = test_images[:10]
+        
+    out_c4 = "ensemble_w50_t90_c3t50_c1t50_area128_submission.csv"
+    out_c5 = "ensemble_w50_t95_c3t50_c1t50_area128_submission.csv"
     
-    data_c4 = []
-    data_c5 = []
-    
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Running Inference"):
-            img_tensors, img_resized_batch, filenames, orig_hs, orig_ws = batch
-            
-            x = img_tensors.to(device)
-            
-            # Predict Synergistic Net Standard
-            out_syn_std = syn_model(x)
-            p_syn_main_std = F.softmax(out_syn_std['main_output'], dim=1).cpu().numpy()
-            p_syn_unet_std = F.softmax(out_syn_std['unet_output'], dim=1).cpu().numpy()
-            p_syn_dl_std = F.softmax(out_syn_std['deeplab_output'], dim=1).cpu().numpy()
-            
-            # Blend calculation
-            p_syn_notta = 0.4 * p_syn_main_std + 0.3 * p_syn_unet_std + 0.3 * p_syn_dl_std
-            for b in range(len(filenames)):
-                p_syn_notta[b, 0] = p_syn_main_std[b, 0]
+    import csv
+    with open(out_c4, 'w', newline='') as f4, open(out_c5, 'w', newline='') as f5:
+        w4 = csv.writer(f4)
+        w5 = csv.writer(f5)
+        w4.writerow(["IMG_ID", "EncodedString"])
+        w5.writerow(["IMG_ID", "EncodedString"])
+        
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        
+        with torch.no_grad():
+            for img_path in tqdm(test_images, desc="Running Inference"):
+                filename = os.path.basename(img_path).replace('.jpg', '')
+                base_img = cv2.imread(img_path)
+                if base_img is None:
+                    print(f"Warning: could not read {img_path}")
+                    continue
+                orig_h, orig_w = base_img.shape[:2]
                 
-            # Predict Meta-Stacked Net
-            meta_logits = meta_model(x)
-            p_meta = F.softmax(meta_logits, dim=1).cpu().numpy()
-            
-            # Process sequentially
-            for b in range(len(filenames)):
-                filename = filenames[b]
-                orig_h = int(orig_hs[b])
-                orig_w = int(orig_ws[b])
-                p_syn = p_syn_notta[b]
-                p_m = p_meta[b]
+                img_rgb = cv2.cvtColor(base_img, cv2.COLOR_BGR2RGB)
+                img_resized = cv2.resize(img_rgb, (DatasetConfig.IMG_WIDTH, DatasetConfig.IMG_HEIGHT))
+                
+                img_tensor = img_resized.astype(np.float32) / 255.0
+                img_tensor = (img_tensor - mean) / std
+                img_tensor = img_tensor.transpose(2, 0, 1)
+                
+                x = torch.tensor(img_tensor[None, ...], dtype=torch.float32).to(device)
+                
+                # Predict Synergistic Net Standard
+                out_syn_std = syn_model(x)
+                p_syn_main_std = F.softmax(out_syn_std['main_output'], dim=1).cpu().numpy()[0]
+                p_syn_unet_std = F.softmax(out_syn_std['unet_output'], dim=1).cpu().numpy()[0]
+                p_syn_dl_std = F.softmax(out_syn_std['deeplab_output'], dim=1).cpu().numpy()[0]
+                
+                # Blend calculation
+                p_syn_notta = 0.4 * p_syn_main_std + 0.3 * p_syn_unet_std + 0.3 * p_syn_dl_std
+                p_syn_notta[0] = p_syn_main_std[0]
+                    
+                # Predict Meta-Stacked Net
+                meta_logits = meta_model(x)
+                p_meta = F.softmax(meta_logits, dim=1).cpu().numpy()[0]
                 
                 # Blend at 480x640 with w_syn = 0.50
-                p_blend = 0.50 * p_syn + 0.50 * p_m
-                p_blend[0] = p_syn[0] # keep class 0 unscaled
+                p_blend = 0.50 * p_syn_notta + 0.50 * p_meta
+                p_blend[0] = p_syn_notta[0] # keep class 0 unscaled
                 
                 # Configuration 4: C0=0.90, C3=0.50, C1=0.50, Area=128
                 pred_c4 = apply_multiclass_thresholding(p_blend.copy(), {0: 0.90, 3: 0.50, 1: 0.50})
@@ -148,36 +162,34 @@ def main():
                 pred_c4_hr = cv2.resize(pred_c4, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
                 pred_c5_hr = cv2.resize(pred_c5, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
                 
+                classes_c4 = set(np.unique(pred_c4))
+                classes_c5 = set(np.unique(pred_c5))
+                
                 for class_id in range(10):
                     # Config 4
-                    if not np.any(pred_c4 == class_id):
-                        data_c4.append([f"{filename}_{class_id:02d}", ""])
+                    if class_id not in classes_c4:
+                        w4.writerow([f"{filename}_{class_id:02d}", ""])
                     else:
-                        data_c4.append([f"{filename}_{class_id:02d}", mask2rle((pred_c4_hr == class_id).astype(np.uint8))])
+                        w4.writerow([f"{filename}_{class_id:02d}", mask2rle((pred_c4_hr == class_id).astype(np.uint8))])
                         
                     # Config 5
-                    if not np.any(pred_c5 == class_id):
-                        data_c5.append([f"{filename}_{class_id:02d}", ""])
+                    if class_id not in classes_c5:
+                        w5.writerow([f"{filename}_{class_id:02d}", ""])
                     else:
-                        data_c5.append([f"{filename}_{class_id:02d}", mask2rle((pred_c5_hr == class_id).astype(np.uint8))])
+                        w5.writerow([f"{filename}_{class_id:02d}", mask2rle((pred_c5_hr == class_id).astype(np.uint8))])
+                
+                del x, out_syn_std, meta_logits, p_syn_notta, p_meta, p_blend, pred_c4, pred_c5, pred_c4_hr, pred_c5_hr
+                gc.collect()
+                torch.cuda.empty_cache()
             
-            del x, out_syn_std, meta_logits, p_syn_notta, p_meta
-            gc.collect()
-            torch.cuda.empty_cache()
-        
     del syn_model, meta_model
     gc.collect()
     torch.cuda.empty_cache()
     
-    out_c4 = "ensemble_w50_t90_c3t50_c1t50_area128_submission.csv"
-    out_c5 = "ensemble_w50_t95_c3t50_c1t50_area128_submission.csv"
-    
-    pd.DataFrame(data_c4, columns=["IMG_ID", "EncodedString"]).to_csv(out_c4, index=False)
-    pd.DataFrame(data_c5, columns=["IMG_ID", "EncodedString"]).to_csv(out_c5, index=False)
-    
     print(f"\nSUCCESS! Generated Additional No-TTA Candidate Submission CSV files:")
     print(f"  - {out_c4}")
     print(f"  - {out_c5}")
+
 
 if __name__ == '__main__':
     main()

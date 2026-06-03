@@ -80,60 +80,62 @@ class FloodNetCompetitiveModel(nn.Module):
             # Evaluation / Inference with built-in Horizontal Flip TTA
             # Run models sequentially to minimize peak VRAM usage
             
+            # Flip input on CPU, then move to device
+            x_flipped = torch.flip(x.cpu(), dims=[3]).to(x.device)
+            
             # 1. UNet TTA pass
             out_unet_std = self.unet(x)
             if isinstance(out_unet_std, dict):
                 out_unet_std = out_unet_std['main_output']
-            p_unet_std = F.softmax(out_unet_std, dim=1)
+            p_unet_std_cpu = F.softmax(out_unet_std, dim=1).cpu()
             del out_unet_std
             
-            x_flipped = torch.flip(x, dims=[3])
             out_unet_flip = self.unet(x_flipped)
             if isinstance(out_unet_flip, dict):
                 out_unet_flip = out_unet_flip['main_output']
-            p_unet_flip = F.softmax(out_unet_flip, dim=1)
-            p_unet_unflip = torch.flip(p_unet_flip, dims=[3])
-            del out_unet_flip, p_unet_flip
+            p_unet_flip_cpu = F.softmax(out_unet_flip, dim=1).cpu()
+            p_unet_unflip_cpu = torch.flip(p_unet_flip_cpu, dims=[3])
+            del out_unet_flip, p_unet_flip_cpu
             
-            p_unet_fused = (p_unet_std + p_unet_unflip) / 2.0
-            del p_unet_std, p_unet_unflip
+            p_unet_fused = (p_unet_std_cpu + p_unet_unflip_cpu) / 2.0
+            del p_unet_std_cpu, p_unet_unflip_cpu
             
             # 2. FCN TTA pass
             out_fcn_std = self.fcn(x)
             if isinstance(out_fcn_std, dict):
                 out_fcn_std = out_fcn_std['main_output']
-            p_fcn_std = F.softmax(out_fcn_std, dim=1)
+            p_fcn_std_cpu = F.softmax(out_fcn_std, dim=1).cpu()
             del out_fcn_std
             
             out_fcn_flip = self.fcn(x_flipped)
             if isinstance(out_fcn_flip, dict):
                 out_fcn_flip = out_fcn_flip['main_output']
-            p_fcn_flip = F.softmax(out_fcn_flip, dim=1)
-            p_fcn_unflip = torch.flip(p_fcn_flip, dims=[3])
-            del out_fcn_flip, p_fcn_flip
+            p_fcn_flip_cpu = F.softmax(out_fcn_flip, dim=1).cpu()
+            p_fcn_unflip_cpu = torch.flip(p_fcn_flip_cpu, dims=[3])
+            del out_fcn_flip, p_fcn_flip_cpu
             
-            p_fcn_fused = (p_fcn_std + p_fcn_unflip) / 2.0
-            del p_fcn_std, p_fcn_unflip
+            p_fcn_fused = (p_fcn_std_cpu + p_fcn_unflip_cpu) / 2.0
+            del p_fcn_std_cpu, p_fcn_unflip_cpu
             
             # 3. DeepLab TTA pass
             out_dl_std = self.deeplab(x)
             if isinstance(out_dl_std, dict):
                 out_dl_std = out_dl_std['main_output']
-            p_dl_std = F.softmax(out_dl_std, dim=1)
+            p_dl_std_cpu = F.softmax(out_dl_std, dim=1).cpu()
             del out_dl_std
             
             out_dl_flip = self.deeplab(x_flipped)
             if isinstance(out_dl_flip, dict):
                 out_dl_flip = out_dl_flip['main_output']
-            p_dl_flip = F.softmax(out_dl_flip, dim=1)
-            p_dl_unflip = torch.flip(p_dl_flip, dims=[3])
-            del out_dl_flip, p_dl_flip, x_flipped
+            p_dl_flip_cpu = F.softmax(out_dl_flip, dim=1).cpu()
+            p_dl_unflip_cpu = torch.flip(p_dl_flip_cpu, dims=[3])
+            del out_dl_flip, p_dl_flip_cpu, x_flipped
             
-            p_dl_fused = (p_dl_std + p_dl_unflip) / 2.0
-            del p_dl_std, p_dl_unflip
+            p_dl_fused = (p_dl_std_cpu + p_dl_unflip_cpu) / 2.0
+            del p_dl_std_cpu, p_dl_unflip_cpu
             
             # 4. Concatenate and pass through meta stacked layer
-            stacked = torch.cat([p_unet_fused, p_fcn_fused, p_dl_fused], dim=1)
+            stacked = torch.cat([p_unet_fused, p_fcn_fused, p_dl_fused], dim=1).to(self.meta_layer.weight.device)
             del p_unet_fused, p_fcn_fused, p_dl_fused
             
             logits = self.meta_layer(stacked)

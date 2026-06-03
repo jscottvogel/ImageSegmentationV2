@@ -18,8 +18,10 @@ mask_paths = sorted(glob.glob(os.path.join(DatasetConfig.TRAIN_MSK_DIR, "*.png")
 _, val_image_paths, _, val_mask_paths = train_test_split(
     image_paths, mask_paths, test_size=0.2, random_state=42
 )
+val_image_paths = val_image_paths[:50]
+val_mask_paths = val_mask_paths[:50]
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cpu')
 
 def load_weights_custom(model, path, device):
     state = torch.load(path, map_location=device, weights_only=True)
