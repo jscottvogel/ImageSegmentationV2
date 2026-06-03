@@ -18,12 +18,12 @@ def multiscale_inference(model, image_tensor):
     if isinstance(out_std, dict):
         out_std = out_std['main_output']
     
-    # Horizontal Flip Pass
-    img_flipped = torch.flip(image_tensor, dims=[3])
+    # Horizontal Flip Pass (perform flip on CPU to prevent HIP invalid device function crashes)
+    img_flipped = torch.flip(image_tensor.cpu(), dims=[3]).to(image_tensor.device)
     out_flip = model(img_flipped)
     if isinstance(out_flip, dict):
         out_flip = out_flip['main_output']
-    out_unflipped = torch.flip(out_flip, dims=[3])
+    out_unflipped = torch.flip(out_flip.cpu(), dims=[3]).to(out_flip.device)
     
     return (out_std + out_unflipped) / 2.0
 

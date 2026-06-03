@@ -476,7 +476,7 @@ def multiscale_inference(model: nn.Module, image_tensor: torch.Tensor) -> torch.
         fused_logits += F.interpolate(out_standard_cpu, size=(h, w), mode='bilinear', align_corners=False) * weight * 0.5
         
         # 2. TTA Forward Pass (Horizontal Flip)
-        scaled_img_flipped_h = torch.flip(scaled_img, dims=[3])
+        scaled_img_flipped_h = torch.flip(scaled_img.cpu(), dims=[3]).to(scaled_img.device)
         out_flipped_h = model(scaled_img_flipped_h)
         if isinstance(out_flipped_h, dict):
             out_flipped_h = out_flipped_h['main_output']

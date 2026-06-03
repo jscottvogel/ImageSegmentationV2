@@ -88,7 +88,8 @@ def main():
         'Ensemble w50 t100 C3 C1 Area64 (No-TTA)': 'ensemble_w50_t100_c3t50_c1t50_area64_submission.csv',
         'Ensemble w50 t100 C3 C1 Area128 (No-TTA)': 'ensemble_w50_t100_c3t50_c1t50_area128_submission.csv',
         'Ensemble w50 t90 C3 C1 Area128 (No-TTA)': 'ensemble_w50_t90_c3t50_c1t50_area128_submission.csv',
-        'Ensemble w50 t95 C3 C1 Area128 (No-TTA)': 'ensemble_w50_t95_c3t50_c1t50_area128_submission.csv'
+        'Ensemble w50 t95 C3 C1 Area128 (No-TTA)': 'ensemble_w50_t95_c3t50_c1t50_area128_submission.csv',
+        'Final Kaggle Submission': 'final_kaggle_submission.csv'
     }
     
     for name, path in paths.items():
