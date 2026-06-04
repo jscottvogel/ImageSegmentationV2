@@ -1,7 +1,6 @@
 # Synergistic Dual-Attention Feature Fusion Network for UAV-Based Flood Damage Semantic Segmentation
 
 **Author**: J. Scott Vogel  
-**Affiliation**: Department of Computer Science, University of Colorado Boulder  
 **Date**: June 2026  
 
 ---
