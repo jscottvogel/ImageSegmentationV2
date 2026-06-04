@@ -55,13 +55,13 @@ graph TD
 *Figure 1: Architectural diagram of the Synergistic Dual-Attention Network.*
 
 ### 3.1 Feature Alignment and Projection
-Let $F_{\text{UNet}} \in \mathbb{R}^{32 \times H \times W}$ represent the feature maps from the final decoder stage of UNet. Let $F_{\text{DL}} \in \mathbb{R}^{64 \times \frac{H}{4} \times \frac{W}{4}}$ and $F_{\text{FCN}} \in \mathbb{R}^{512 \times \frac{H}{8} \times \frac{W}{8}}$ represent the intermediate outputs of the DeepLab and FCN decoders, respectively. To prevent the FCN's high-rank representation from dominating the feature pool, we apply a 1x1 projection convolution $\mathcal{P}$:
+Let $F_{UNet} \in \mathbb{R}^{32 \times H \times W}$ represent the feature maps from the final decoder stage of UNet. Let $F_{DL} \in \mathbb{R}^{64 \times \frac{H}{4} \times \frac{W}{4}}$ and $F_{FCN} \in \mathbb{R}^{512 \times \frac{H}{8} \times \frac{W}{8}}$ represent the intermediate outputs of the DeepLab and FCN decoders, respectively. To prevent the FCN's high-rank representation from dominating the feature pool, we apply a 1x1 projection convolution $\mathcal{P}$:
 
-$$F_{\text{FCN\_proj}} = \text{ReLU}(\text{BatchNorm}(\mathcal{P}(F_{\text{FCN}}))) \in \mathbb{R}^{64 \times \frac{H}{8} \times \frac{W}{8}}$$
+$$F_{FCN-proj} = \text{ReLU}(\text{BatchNorm}(\mathcal{P}(F_{FCN}))) \in \mathbb{R}^{64 \times \frac{H}{8} \times \frac{W}{8}}$$
 
 We align all spatial resolutions to $1/1$ native scale via bilinear interpolation $\mathcal{U}$:
 
-$$F_{\text{concat}} = \left[ F_{\text{UNet}} \;\|\; \mathcal{U}(F_{\text{DL}}) \;\|\; \mathcal{U}(F_{\text{FCN\_proj}}) \right] \in \mathbb{R}^{160 \times H \times W}$$
+$$F_{concat} = \left[ F_{UNet} \;\|\; \mathcal{U}(F_{DL}) \;\|\; \mathcal{U}(F_{FCN-proj}) \right] \in \mathbb{R}^{160 \times H \times W}$$
 
 where $\|$ denotes channel-wise concatenation.
 
@@ -73,7 +73,7 @@ The channel attention module compresses spatial dimensions using both average an
 
 $$M_c(F) = \sigma(\text{MLP}(\text{AvgPool}(F)) + \text{MLP}(\text{MaxPool}(F)))$$
 
-$$F' = M_c(F_{\text{concat}}) \otimes F_{\text{concat}}$$
+$$F' = M_c(F_{concat}) \otimes F_{concat}$$
 
 where $\sigma$ denotes the sigmoid function, and $\otimes$ denotes element-wise multiplication.
 
@@ -89,11 +89,11 @@ The refined feature stack $F''$ is passed to a lightweight convolution head to g
 ### 3.3 Training Strategy
 To avoid representation drift in the pre-trained base models, we lock the backbones and decoders of UNet, DeepLab, and FCN:
 
-$$\theta_{\text{base}} = \text{Frozen} \quad (\nabla_{\theta_{\text{base}}} \mathcal{L} = 0)$$
+$$\theta_{base} = \text{Frozen} \quad (\nabla_{\theta_{base}} \mathcal{L} = 0)$$
 
-We optimize only the attention parameters and the projection/fusion heads using a hybrid loss function $\mathcal{L}_{\text{hybrid}}$ combining Online Hard Example Mining (OHEM) Cross-Entropy and Lovasz-Softmax [6]:
+We optimize only the attention parameters and the projection/fusion heads using a hybrid loss function $\mathcal{L}_{hybrid}$ combining Online Hard Example Mining (OHEM) Cross-Entropy and Lovasz-Softmax [6]:
 
-$$\mathcal{L}_{\text{hybrid}} = 0.1 \mathcal{L}_{\text{OHEM}} + 0.3 \mathcal{L}_{\text{Focal}} + 0.6 \mathcal{L}_{\text{Lovasz}} + 0.2 \mathcal{L}_{\text{ActiveContour}}$$
+$$\mathcal{L}_{hybrid} = 0.1 \mathcal{L}_{OHEM} + 0.3 \mathcal{L}_{Focal} + 0.6 \mathcal{L}_{Lovasz} + 0.2 \mathcal{L}_{ActiveContour}$$
 
 The model is trained for 3 epochs with a learning rate of $5 \times 10^{-4}$ using the AdamW optimizer.
 
@@ -103,15 +103,15 @@ The model is trained for 3 epochs with a learning rate of $5 \times 10^{-4}$ usi
 To maximize the macro Jaccard index evaluated row-wise, we implement a decoupled post-processing optimization pipeline on the validation dataset.
 
 ### 4.1 Powell's Method for Calibration
-We blend the softmax outputs of our synergistic network $P_{\text{syn}}$ and the meta-stacked ensemble $P_{\text{meta}}$ using class-specific blending weights $w \in [0, 1]^{10}$:
+We blend the softmax outputs of our synergistic network $P_{syn}$ and the meta-stacked ensemble $P_{meta}$ using class-specific blending weights $w \in [0, 1]^{10}$:
 
-$$P_{\text{blend}}(c) = w_c P_{\text{syn}}(c) + (1 - w_c) P_{\text{meta}}(c)$$
+$$P_{blend}(c) = w_c P_{syn}(c) + (1 - w_c) P_{meta}(c)$$
 
 We assign probability thresholds $t \in [0, 1]^{10}$. If the predicted class for a pixel falls below $t_c$, the prediction reverts to the highest-probability class among the unconstrained fallback classes (where $t = 0.0$):
 
 $$\hat{y} = \begin{cases} 
-      \text{argmax}_c P_{\text{blend}}(c) & \text{if } \max_c P_{\text{blend}}(c) \ge t_c \\
-      \text{argmax}_{k \in \mathcal{K}_{\text{fallback}}} P_{\text{blend}}(k) & \text{otherwise}
+      \text{argmax}_c P_{blend}(c) & \text{if } \max_c P_{blend}(c) \ge t_c \\
+      \text{argmax}_{k \in \mathcal{K}_{fallback}} P_{blend}(k) & \text{otherwise}
    \end{cases}$$
 
 We solve for $w$ and $t$ using Powell's multidimensional conjugate direction search to maximize the macro Dice score.
@@ -159,7 +159,7 @@ Experiments were conducted on the FloodNet dataset, consisting of UAV-acquired h
 ### 5.3 Optimal Post-Processing Configuration
 The optimization routine yielded the parameters detailed in **Table 2**.
 
-| Class ID | Semantic Label | Blending Weight ($w_{\text{syn}}$) | Threshold ($t_c$) | Min Area ($A_c$) |
+| Class ID | Semantic Label | Blending Weight ($w_{syn}$) | Threshold ($t_c$) | Min Area ($A_c$) |
 | :---: | :--- | :---: | :---: | :---: |
 | 0 | Background | 0.5000 | 0.9911 | 384 |
 | 1 | Building Flooded | 1.0000 | 0.0000 | 160 |
