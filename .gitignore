@@ -106,3 +106,6 @@ docs/_build/
 *.swo
 *~
 .DS_Store
+
+preprocessed_cache
+**/tensorboard/

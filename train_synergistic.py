@@ -224,6 +224,18 @@ class FastFloodNetPyTorchDataset(Dataset):
 def initialize_synergistic_weights(model, device, logger):
     checkpoint_dir = "model_checkpoint"
     
+    # 0. Load entire synergistic model weights if they exist (for EXP-03 fine-tuning)
+    synergistic_path = os.path.join(checkpoint_dir, "FloodNet_Synergistic", "best_synergistic_weights.pt")
+    if os.path.exists(synergistic_path):
+        logger.info(f"Initializing entire model from {synergistic_path}")
+        state = torch.load(synergistic_path, map_location=device, weights_only=True)
+        state = {k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state.items() if k != "n_averaged"}
+        # Load with strict=False to skip the new spatial_attention parameters
+        model.load_state_dict(state, strict=False)
+        logger.info("Loaded pre-trained synergistic weights successfully.")
+        for h in logger.handlers: h.flush()
+        return
+        
     # 1. Load UNet weights
     unet_path = os.path.join(checkpoint_dir, "FloodNet_UNet", "best_unet_weights.pt")
     if os.path.exists(unet_path):
@@ -281,12 +293,14 @@ def train_synergistic():
     for h in logger.handlers: h.flush()
     
     dry_run = os.environ.get("DRY_RUN", "0") == "1"
+    freeze_decoders = True  # Set to True for fast fusion-only fine-tuning in EXP-03
     if dry_run:
         TrainingConfig.EPOCHS = 1
         TrainingConfig.LOG_INTERVAL = 1
         checkpoint_dir = "model_checkpoint/FloodNet_Synergistic_DryRun"
     else:
-        TrainingConfig.EPOCHS = 15
+        # Train for 3 epochs if decoders are frozen, otherwise 15 epochs
+        TrainingConfig.EPOCHS = 3 if freeze_decoders else 15
     TrainingConfig.ROUTER_EPOCH = 0 # Use Phase 2 Lovasz/OHEM hybrid loss from the start
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -305,15 +319,24 @@ def train_synergistic():
     for param in model.parameters():
         param.requires_grad = True
         
-    for param in model.unet.backbone.parameters():
-        param.requires_grad = False
-    for param in model.deeplab.backbone.parameters():
-        param.requires_grad = False
-    for param in model.fcn.model.backbone.parameters():
-        param.requires_grad = False
+    if freeze_decoders:
+        logger.info("Freezing base model decoders (UNet, DeepLab, FCN) for fast fusion tuning.")
+        for param in model.unet.parameters():
+            param.requires_grad = False
+        for param in model.deeplab.parameters():
+            param.requires_grad = False
+        for param in model.fcn.parameters():
+            param.requires_grad = False
+    else:
+        for param in model.unet.backbone.parameters():
+            param.requires_grad = False
+        for param in model.deeplab.backbone.parameters():
+            param.requires_grad = False
+        for param in model.fcn.model.backbone.parameters():
+            param.requires_grad = False
         
     # 4. Optimizer for fusion and decoders
-    fusion_params = list(model.fusion_conv.parameters()) + list(model.fcn_proj.parameters()) + list(model.channel_attention.parameters())
+    fusion_params = list(model.fusion_conv.parameters()) + list(model.fcn_proj.parameters()) + list(model.channel_attention.parameters()) + list(model.spatial_attention.parameters())
     decoder_params = [p for p in (list(model.unet.parameters()) + list(model.deeplab.parameters()) + list(model.fcn.parameters())) if p.requires_grad]
     
     trainable_params = fusion_params + decoder_params
@@ -321,10 +344,9 @@ def train_synergistic():
     logger.info(f"Number of trainable parameters in decoders: {len(decoder_params)}")
     logger.info(f"Number of trainable parameters in fusion head: {len(fusion_params)}")
     
-    param_groups = [
-        {'params': fusion_params, 'lr': 5e-4},
-        {'params': decoder_params, 'lr': 2e-5}
-    ]
+    param_groups = [{'params': fusion_params, 'lr': 5e-4}]
+    if len(decoder_params) > 0:
+        param_groups.append({'params': decoder_params, 'lr': 2e-5})
     
     optimizer = torch.optim.AdamW(
         param_groups, 
